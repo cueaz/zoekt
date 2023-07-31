@@ -31,14 +31,64 @@ import (
 	"github.com/sourcegraph/zoekt/shards"
 )
 
-func displayMatches(files []zoekt.FileMatch, pat string, withRepo bool, list bool) {
-	for _, f := range files {
+const colorRed = "\033[0;31m"
+const colorGreen = "\033[0;32m"
+const colorYellow = "\033[0;33m"
+const colorBlue = "\033[0;34m"
+const colorCyan = "\033[0;36m"
+const colorNone = "\033[0m"
+
+func displayMatches(files []zoekt.FileMatch, pat string, withRepo bool, list bool, color bool, vimgrep bool) {
+	for i, f := range files {
 		r := ""
 		if withRepo {
 			r = f.Repository + "/"
 		}
 		if list {
 			fmt.Printf("%s%s\n", r, f.FileName)
+			continue
+		}
+		if vimgrep {
+			for _, m := range f.LineMatches {
+				if m.LineNumber <= 0 {
+					continue
+				}
+				for _, l := range m.LineFragments {
+					fmt.Printf("%s%s:%d:%d:%s\n", r, f.FileName, m.LineNumber, l.LineOffset + 1, m.Line)
+				}
+			}
+			continue
+		}
+		if color {
+			fmt.Printf("%s%s%s", colorYellow, r, f.FileName)
+			if len(f.Branches) > 0 {
+				for j, b := range f.Branches {
+					color := colorBlue
+					if b == "HEAD" {
+						color = colorCyan
+					}
+					if j == 0 {
+						fmt.Printf(" (%s%s", color, b)
+					} else {
+						fmt.Printf("%s, %s%s", colorYellow, color, b)
+					}
+				}
+				fmt.Printf("%s)", colorYellow)
+			}
+			fmt.Printf("%s\n", colorNone)
+			for _, m := range f.LineMatches {
+				fmt.Printf("%s%d%s:", colorGreen, m.LineNumber, colorNone)
+				p := 0
+				for _, l := range m.LineFragments {
+					fmt.Printf("%s", m.Line[p:l.LineOffset])
+					fmt.Printf("%s%s%s", colorRed, m.Line[l.LineOffset:l.LineOffset+l.MatchLength], colorNone)
+					p = l.LineOffset + l.MatchLength
+				}
+				fmt.Printf("%s\n", m.Line[p:])
+			}
+			if i < len(files) - 1 {
+				fmt.Printf("\n")
+			}
 			continue
 		}
 
@@ -133,6 +183,8 @@ func main() {
 	verbose := flag.Bool("v", false, "print some background data")
 	withRepo := flag.Bool("r", false, "print the repo before the file name")
 	list := flag.Bool("l", false, "print matching filenames only")
+	color := flag.Bool("color", false, "colorize output")
+	vimgrep := flag.Bool("vimgrep", false, "print additional column numbers")
 
 	flag.Usage = func() {
 		name := os.Args[0]
@@ -185,7 +237,7 @@ func main() {
 		sres, _ = searcher.Search(context.Background(), query, &sOpts)
 	}
 
-	displayMatches(sres.Files, pat, *withRepo, *list)
+	displayMatches(sres.Files, pat, *withRepo, *list, *color, *vimgrep)
 	if *verbose {
 		log.Printf("stats: %#v", sres.Stats)
 	}
