@@ -1080,16 +1080,9 @@ func (b *Builder) writeShard(fn string, ib *zoekt.IndexBuilder) (*finishedShard,
 	if err := ib.Write(f); err != nil {
 		return nil, err
 	}
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-
-	log.Printf("finished %s: %d index bytes (overhead %3.1f)", fn, fi.Size(),
-		float64(fi.Size())/float64(ib.ContentSize()+1))
 
 	return &finishedShard{f.Name(), fn}, nil
 }

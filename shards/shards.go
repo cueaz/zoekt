@@ -299,8 +299,6 @@ func (tl *loader) load(keys ...string) {
 		tl.ss.replace(chunk)
 	}
 
-	log.Printf("loading %d shard(s): %s", len(keys), humanTruncateList(keys, 5))
-
 	lastProgress := time.Now()
 	for i, key := range keys {
 		// If taking a while to start-up occasionally give a progress message
