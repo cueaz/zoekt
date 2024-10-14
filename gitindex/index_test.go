@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v5"
@@ -56,7 +59,7 @@ func TestIndexEmptyRepo(t *testing.T) {
 		},
 	}
 
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 }
@@ -562,12 +565,12 @@ func TestIndexDeltaBasic(t *testing.T) {
 
 							file := filepath.Join(repositoryDir, d.Name)
 
-							err := os.MkdirAll(filepath.Dir(file), 0755)
+							err := os.MkdirAll(filepath.Dir(file), 0o755)
 							if err != nil {
 								t.Fatalf("ensuring that folders exist for file %q: %s", file, err)
 							}
 
-							err = os.WriteFile(file, d.Content, 0644)
+							err = os.WriteFile(file, d.Content, 0o644)
 							if err != nil {
 								t.Fatalf("writing file %q: %s", d.Name, err)
 							}
@@ -607,19 +610,19 @@ func TestIndexDeltaBasic(t *testing.T) {
 					// setup: prepare spy versions of prepare delta / normal build so that we can observe
 					// whether they were called appropriately
 					deltaBuildCalled := false
-					prepareDeltaSpy := func(options Options, repository *git.Repository) (repos map[fileKey]BlobLocation, branchMap map[fileKey][]string, branchVersions map[string]map[string]plumbing.Hash, changedOrDeletedPaths []string, err error) {
+					prepareDeltaSpy := func(options Options, repository *git.Repository) (repos map[fileKey]BlobLocation, branchVersions map[string]map[string]plumbing.Hash, changedOrDeletedPaths []string, err error) {
 						deltaBuildCalled = true
 						return prepareDeltaBuild(options, repository)
 					}
 
 					normalBuildCalled := false
-					prepareNormalSpy := func(options Options, repository *git.Repository) (repos map[fileKey]BlobLocation, branchMap map[fileKey][]string, branchVersions map[string]map[string]plumbing.Hash, err error) {
+					prepareNormalSpy := func(options Options, repository *git.Repository) (repos map[fileKey]BlobLocation, branchVersions map[string]map[string]plumbing.Hash, err error) {
 						normalBuildCalled = true
 						return prepareNormalBuild(options, repository)
 					}
 
 					// run test
-					err := indexGitRepo(options, gitIndexConfig{
+					_, err := indexGitRepo(options, gitIndexConfig{
 						prepareDeltaBuild:  prepareDeltaSpy,
 						prepareNormalBuild: prepareNormalSpy,
 					})
@@ -744,7 +747,7 @@ func TestRepoPathRanks(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got := pathRanks.rank(tt.path)
+			got := pathRanks.rank(tt.path, nil)
 			if got != tt.rank {
 				t.Errorf("expected file '%s' to have rank %f, but got %f", tt.path, tt.rank, got)
 			}
@@ -753,15 +756,163 @@ func TestRepoPathRanks(t *testing.T) {
 }
 
 func runScript(t *testing.T, cwd string, script string) {
-	err := os.MkdirAll(cwd, 0755)
+	t.Helper()
+
+	err := os.MkdirAll(cwd, 0o755)
 	if err != nil {
 		t.Fatalf("ensuring path %q exists: %s", cwd, err)
 	}
 
 	cmd := exec.Command("sh", "-euxc", script)
 	cmd.Dir = cwd
+	cmd.Env = append([]string{"GIT_CONFIG_GLOBAL=", "GIT_CONFIG_SYSTEM="}, os.Environ()...)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("execution error: %v, output %s", err, out)
+	}
+}
+
+func TestSetTemplates_e2e(t *testing.T) {
+	repositoryDir := t.TempDir()
+
+	// setup: initialize the repository and all of its branches
+	runScript(t, repositoryDir, "git init -b master")
+	runScript(t, repositoryDir, "git config remote.origin.url git@github.com:sourcegraph/zoekt.git")
+	desc := zoekt.Repository{}
+	if err := setTemplatesFromConfig(&desc, repositoryDir); err != nil {
+		t.Fatalf("setTemplatesFromConfig: %v", err)
+	}
+
+	if got, want := desc.FileURLTemplate, `{{URLJoinPath "https://github.com/sourcegraph/zoekt" "blob" .Version .Path}}`; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestSetTemplates(t *testing.T) {
+	base := "https://example.com/repo/name"
+	version := "VERSION"
+	path := "dir/name.txt"
+	lineNumber := 10
+	cases := []struct {
+		typ    string
+		commit string
+		file   string
+		line   string
+	}{{
+		typ:    "gitiles",
+		commit: "https://example.com/repo/name/%2B/VERSION",
+		file:   "https://example.com/repo/name/%2B/VERSION/dir/name.txt",
+		line:   "#10",
+	}, {
+		typ:    "github",
+		commit: "https://example.com/repo/name/commit/VERSION",
+		file:   "https://example.com/repo/name/blob/VERSION/dir/name.txt",
+		line:   "#L10",
+	}, {
+		typ:    "cgit",
+		commit: "https://example.com/repo/name/commit/?id=VERSION",
+		file:   "https://example.com/repo/name/tree/dir/name.txt/?id=VERSION",
+		line:   "#n10",
+	}, {
+		typ:    "gitweb",
+		commit: "https://example.com/repo/name;a=commit;h=VERSION",
+		file:   "https://example.com/repo/name;a=blob;f=dir/name.txt;hb=VERSION",
+		line:   "#l10",
+	}, {
+		typ:    "source.bazel.build",
+		commit: "https://example.com/repo/name/%2B/VERSION",
+		file:   "https://example.com/repo/name/%2B/VERSION:dir/name.txt",
+		line:   ";l=10",
+	}, {
+		typ:    "bitbucket-server",
+		commit: "https://example.com/repo/name/commits/VERSION",
+		file:   "https://example.com/repo/name/dir/name.txt?at=VERSION",
+		line:   "#10",
+	}, {
+		typ:    "gitlab",
+		commit: "https://example.com/repo/name/-/commit/VERSION",
+		file:   "https://example.com/repo/name/-/blob/VERSION/dir/name.txt",
+		line:   "#L10",
+	}, {
+		typ:    "gitea",
+		commit: "https://example.com/repo/name/commit/VERSION",
+		file:   "https://example.com/repo/name/src/commit/VERSION/dir/name.txt?display=source",
+		line:   "#L10",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.typ, func(t *testing.T) {
+			assertOutput := func(templateText string, want string) {
+				t.Helper()
+
+				tt, err := zoekt.ParseTemplate(templateText)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var sb strings.Builder
+				err = tt.Execute(&sb, map[string]any{
+					"Version":    version,
+					"Path":       path,
+					"LineNumber": lineNumber,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := sb.String(); got != want {
+					t.Fatalf("want: %q\ngot:  %q", want, got)
+				}
+			}
+
+			var repo zoekt.Repository
+			u, _ := url.Parse(base)
+			err := setTemplates(&repo, u, tc.typ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOutput(repo.CommitURLTemplate, tc.commit)
+			assertOutput(repo.FileURLTemplate, tc.file)
+			assertOutput(repo.LineFragmentTemplate, tc.line)
+		})
+	}
+}
+
+func BenchmarkPrepareNormalBuild(b *testing.B) {
+	// NOTE: To run the benchmark, download a large repo (like github.com/chromium/chromium/) and change this to its path.
+	repoDir := "/path/to/your/repo"
+	repo, err := git.PlainOpen(repoDir)
+	if err != nil {
+		b.Fatalf("Failed to open test repository: %v", err)
+	}
+
+	opts := Options{
+		RepoDir:      repoDir,
+		Submodules:   false,
+		BranchPrefix: "refs/heads/",
+		Branches:     []string{"main"},
+		BuildOptions: build.Options{
+			RepositoryDescription: zoekt.Repository{
+				Name: "test-repo",
+				URL:  "https://github.com/example/test-repo",
+			},
+		},
+	}
+
+	b.ReportAllocs()
+
+	repos, branchVersions, err := prepareNormalBuild(opts, repo)
+	if err != nil {
+		b.Fatalf("prepareNormalBuild failed: %v", err)
+	}
+
+	runtime.GC()
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	b.ReportMetric(float64(m.HeapInuse), "heap-used-bytes")
+	b.ReportMetric(float64(m.HeapInuse), "heap-allocated-bytes")
+
+	if len(repos) == 0 || len(branchVersions) == 0 {
+		b.Fatalf("Unexpected empty results")
 	}
 }

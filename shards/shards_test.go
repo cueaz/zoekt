@@ -37,7 +37,6 @@ import (
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
-	"github.com/sourcegraph/zoekt/stream"
 )
 
 type crashSearcher struct{}
@@ -230,12 +229,12 @@ func TestShardedSearcher_DocumentRanking(t *testing.T) {
 	ss := newShardedSearcher(1)
 
 	var nextShardNum int
-	addShard := func(repo string, priority float64, docs ...zoekt.Document) {
+	addShard := func(repo string, rank uint16, docs ...zoekt.Document) {
 		r := &zoekt.Repository{ID: hash(repo), Name: repo}
 		r.RawConfig = map[string]string{
-			"public":   "1",
-			"priority": strconv.FormatFloat(priority, 'f', 2, 64),
+			"public": "1",
 		}
+		r.Rank = rank
 		b := testIndexBuilder(t, r, docs...)
 		shard := searcherForTest(t, b)
 		ss.replace(map[string]zoekt.Searcher{
@@ -244,10 +243,10 @@ func TestShardedSearcher_DocumentRanking(t *testing.T) {
 		nextShardNum++
 	}
 
-	addShard("weekend-project", 20, zoekt.Document{Name: "f1", Content: []byte("foobar")})
-	addShard("moderately-popular", 500, zoekt.Document{Name: "f2", Content: []byte("foobaz")})
-	addShard("weekend-project-2", 20, zoekt.Document{Name: "f3", Content: []byte("foo bar")})
-	addShard("super-star", 5000, zoekt.Document{Name: "f4", Content: []byte("foo baz")},
+	addShard("old-project", 1, zoekt.Document{Name: "f1", Content: []byte("foobar")})
+	addShard("recent", 2, zoekt.Document{Name: "f2", Content: []byte("foobaz")})
+	addShard("old-project-2", 1, zoekt.Document{Name: "f3", Content: []byte("foo bar")})
+	addShard("new", 3, zoekt.Document{Name: "f4", Content: []byte("foo baz")},
 		zoekt.Document{Name: "f5", Content: []byte("fooooo")})
 
 	// Run a stream search and gather the results
@@ -258,10 +257,9 @@ func TestShardedSearcher_DocumentRanking(t *testing.T) {
 	}
 
 	err := ss.StreamSearch(context.Background(), &query.Substring{Pattern: "foo"}, opts,
-		stream.SenderFunc(func(event *zoekt.SearchResult) {
+		zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 			results = append(results, event)
 		}))
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,12 +287,16 @@ func TestShardedSearcher_DocumentRanking(t *testing.T) {
 func TestFilteringShardsByRepoSetOrBranchesReposOrRepoIDs(t *testing.T) {
 	ss := newShardedSearcher(1)
 
+	// namePrefix is so we can create a repo:foo filter and match the same set
+	// of repos.
+	namePrefix := [3]string{"foo", "bar", "baz"}
+
 	repoSetNames := []string{}
 	repoIDs := []uint32{}
 	n := 10 * runtime.GOMAXPROCS(0)
 	for i := 0; i < n; i++ {
 		shardName := fmt.Sprintf("shard%d", i)
-		repoName := fmt.Sprintf("repository%.3d", i)
+		repoName := fmt.Sprintf("%s-repository%.3d", namePrefix[i%3], i)
 		repoID := hash(repoName)
 
 		if i%3 == 0 {
@@ -330,6 +332,7 @@ func TestFilteringShardsByRepoSetOrBranchesReposOrRepoIDs(t *testing.T) {
 	sub := &query.Substring{Pattern: "bla"}
 
 	repoIDsQuery := query.NewRepoIDs(repoIDs...)
+	repoQuery := &query.Repo{Regexp: regexp.MustCompile("^foo-.*")}
 
 	queries := []query.Q{
 		query.NewAnd(set, sub),
@@ -343,6 +346,19 @@ func TestFilteringShardsByRepoSetOrBranchesReposOrRepoIDs(t *testing.T) {
 		query.NewAnd(repoIDsQuery, sub),
 		// Test with the same repoIDs again
 		query.NewAnd(repoIDsQuery, sub),
+
+		query.NewAnd(repoQuery, sub),
+		query.NewAnd(repoQuery, sub),
+
+		// List has queries which are just the reposet atoms. We also test twice.
+		set,
+		set,
+		branchesRepos,
+		branchesRepos,
+		repoIDsQuery,
+		repoIDsQuery,
+		repoQuery,
+		repoQuery,
 	}
 
 	for _, q := range queries {
@@ -497,8 +513,8 @@ func TestShardedSearcher_List(t *testing.T) {
 			},
 		},
 		{
-			name: "minimal=false",
-			opts: &zoekt.ListOptions{Minimal: false},
+			name: "default",
+			opts: &zoekt.ListOptions{},
 			want: &zoekt.RepoList{
 				Repos: []*zoekt.RepoListEntry{
 					{
@@ -508,25 +524,6 @@ func TestShardedSearcher_List(t *testing.T) {
 					{
 						Repository: *repos[1],
 						Stats:      stats,
-					},
-				},
-				Stats: aggStats,
-			},
-		},
-		{
-			name: "minimal=true",
-			opts: &zoekt.ListOptions{Minimal: true},
-			want: &zoekt.RepoList{
-				Repos: []*zoekt.RepoListEntry{
-					{
-						Repository: *repos[1],
-						Stats:      stats,
-					},
-				},
-				Minimal: map[uint32]*zoekt.MinimalRepoListEntry{
-					repos[0].ID: {
-						HasSymbols: repos[0].HasSymbols,
-						Branches:   repos[0].Branches,
 					},
 				},
 				Stats: aggStats,
@@ -544,25 +541,6 @@ func TestShardedSearcher_List(t *testing.T) {
 					{
 						Repository: *repos[1],
 						Stats:      stats,
-					},
-				},
-				Stats: aggStats,
-			},
-		},
-		{
-			name: "field=minimal",
-			opts: &zoekt.ListOptions{Field: zoekt.RepoListFieldMinimal},
-			want: &zoekt.RepoList{
-				Repos: []*zoekt.RepoListEntry{
-					{
-						Repository: *repos[1],
-						Stats:      stats,
-					},
-				},
-				Minimal: map[uint32]*zoekt.MinimalRepoListEntry{
-					repos[0].ID: {
-						HasSymbols: repos[0].HasSymbols,
-						Branches:   repos[0].Branches,
 					},
 				},
 				Stats: aggStats,
@@ -901,7 +879,6 @@ func TestSendByRepository(t *testing.T) {
 	// n1, n2, n3 are the number of file matches for each of the 3 repositories in this
 	// test.
 	f := func(n1, n2, n3 uint8) bool {
-
 		sr := createMockSearchResult(n1, n2, n3, wantStats)
 
 		mock := &mockSender{}
@@ -1110,7 +1087,7 @@ func TestAtomCountScore(t *testing.T) {
 	}
 }
 
-func TestUseKeywordScoring(t *testing.T) {
+func TestUseBM25Scoring(t *testing.T) {
 	b := testIndexBuilder(t,
 		&zoekt.Repository{},
 		zoekt.Document{Name: "f1", Content: []byte("one two two three")},
@@ -1126,7 +1103,7 @@ func TestUseKeywordScoring(t *testing.T) {
 		&query.Substring{Pattern: "three"})
 
 	opts := zoekt.SearchOptions{
-		UseKeywordScoring: true,
+		UseBM25Scoring: true,
 	}
 
 	results, err := ss.Search(context.Background(), q, &opts)
@@ -1151,7 +1128,7 @@ func testShardedStreamSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder, us
 	ss.replace(map[string]zoekt.Searcher{"r1": searcher})
 
 	var files []zoekt.FileMatch
-	sender := stream.SenderFunc(func(result *zoekt.SearchResult) {
+	sender := zoekt.SenderFunc(func(result *zoekt.SearchResult) {
 		files = append(files, result.Files...)
 	})
 

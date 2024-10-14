@@ -15,7 +15,9 @@
 package zoekt
 
 import (
+	"cmp"
 	"encoding/binary"
+	"math"
 	"sort"
 	"unicode"
 	"unicode/utf8"
@@ -108,7 +110,17 @@ func (n ngram) String() string {
 type runeNgramOff struct {
 	ngram ngram
 	// index is the original index inside of the returned array of splitNGrams
-	index uint32
+	index int
+}
+
+func (a runeNgramOff) Compare(b runeNgramOff) int {
+	if a.ngram == b.ngram {
+		return cmp.Compare(a.index, b.index)
+	} else if a.ngram < b.ngram {
+		return -1
+	} else {
+		return 1
+	}
 }
 
 func splitNGrams(str []byte) []runeNgramOff {
@@ -137,9 +149,10 @@ func splitNGrams(str []byte) []runeNgramOff {
 		ng := runesToNGram(runeGram)
 		result = append(result, runeNgramOff{
 			ngram: ng,
-			index: uint32(len(result)),
+			index: len(result),
 		})
 	}
+
 	return result
 }
 
@@ -390,4 +403,8 @@ func (m runeOffsetMap) lookup(runeOffset uint32) (uint32, uint32) {
 
 func (m runeOffsetMap) sizeBytes() int {
 	return 8 * len(m)
+}
+
+func epsilonEqualsOne(scoreWeight float64) bool {
+	return scoreWeight == 1 || math.Abs(scoreWeight-1.0) < 1e-9
 }

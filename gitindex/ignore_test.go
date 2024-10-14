@@ -17,7 +17,7 @@ import (
 )
 
 func createSourcegraphignoreRepo(dir string) error {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	script := `mkdir repo
@@ -73,7 +73,7 @@ func TestIgnore(t *testing.T) {
 		Submodules:   true,
 		Incremental:  true,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 

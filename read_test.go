@@ -32,7 +32,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -58,7 +57,6 @@ func TestReadWrite(t *testing.T) {
 
 	var toc indexTOC
 	err = r.readTOC(&toc)
-
 	if err != nil {
 		t.Errorf("got read error %v", err)
 	}
@@ -272,7 +270,7 @@ func TestReadSearch(t *testing.T) {
 			if raw, err := json.MarshalIndent(got, "", "  "); err != nil {
 				t.Errorf("failed marshalling search results for %s during updating: %v", name, err)
 				continue
-			} else if err := os.WriteFile(golden, raw, 0644); err != nil {
+			} else if err := os.WriteFile(golden, raw, 0o644); err != nil {
 				t.Errorf("failed writing search results for %s during updating: %v", name, err)
 				continue
 			}
@@ -307,8 +305,8 @@ func TestReadSearch(t *testing.T) {
 				continue
 			}
 
-			if d := cmp.Diff(res.Files, want.FileMatches[j]); d != "" {
-				t.Errorf("matches for %s on %s\n%s", q, name, d)
+			if d := cmp.Diff(want.FileMatches[j], res.Files); d != "" {
+				t.Errorf("matches for %s on %s (-want +got)\n%s", q, name, d)
 			}
 		}
 	}
@@ -376,7 +374,7 @@ func TestBackwardsCompat(t *testing.T) {
 		outname := fmt.Sprintf("testdata/backcompat/new_v%d.%05d.zoekt", IndexFormatVersion, 0)
 		t.Log("writing new file", outname)
 
-		err = os.WriteFile(outname, buf.Bytes(), 0644)
+		err = os.WriteFile(outname, buf.Bytes(), 0o644)
 		if err != nil {
 			t.Fatalf("Creating output file: %v", err)
 		}
@@ -402,7 +400,6 @@ func TestBackwardsCompat(t *testing.T) {
 
 				var toc indexTOC
 				err = r.readTOC(&toc)
-
 				if err != nil {
 					t.Errorf("got read error %v", err)
 				}
@@ -468,4 +465,33 @@ func TestEncodeRanks(t *testing.T) {
 
 		return true
 	}, nil)
+}
+
+func BenchmarkReadMetadata(b *testing.B) {
+	file, err := os.Open("testdata/benchmark/zoekt_v16.00000.zoekt")
+	if err != nil {
+		b.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	indexFile, err := NewIndexFile(file)
+	if err != nil {
+		b.Fatalf("could not open index: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		repos, metadata, err := ReadMetadata(indexFile)
+		if err != nil {
+			b.Fatalf("ReadMetadata failed: %v", err)
+		}
+		if len(repos) != 1 {
+			b.Fatalf("expected 1 repository")
+		}
+		if metadata == nil {
+			b.Fatalf("expected non-nil metadata")
+		}
+	}
 }

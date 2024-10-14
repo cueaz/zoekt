@@ -21,65 +21,69 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sourcegraph/zoekt/query"
 )
 
-const mapHeaderBytes uint64 = 48
-const sliceHeaderBytes uint64 = 24
-const stringHeaderBytes uint64 = 16
-const pointerSize uint64 = 8
-const interfaceBytes uint64 = 16
+const (
+	mapHeaderBytes    uint64 = 48
+	sliceHeaderBytes  uint64 = 24
+	stringHeaderBytes uint64 = 16
+	pointerSize       uint64 = 8
+	interfaceBytes    uint64 = 16
+)
 
 // FileMatch contains all the matches within a file.
 type FileMatch struct {
-	// Ranking; the higher, the better.
-	Score float64 // TODO - hide this field?
-
-	// For debugging. Needs DebugScore set, but public so tests in
-	// other packages can print some diagnostics.
-	Debug string
-
 	FileName string
 
 	// Repository is the globally unique name of the repo of the
 	// match
 	Repository string
-	Branches   []string
 
-	// One of LineMatches or ChunkMatches will be returned depending on whether
-	// the SearchOptions.ChunkMatches is set.
-	LineMatches  []LineMatch
-	ChunkMatches []ChunkMatch
+	// SubRepositoryName is the globally unique name of the repo,
+	// if it came from a subrepository
+	SubRepositoryName string `json:",omitempty"`
 
-	// RepositoryID is a Sourcegraph extension. This is the ID of Repository in
-	// Sourcegraph.
-	RepositoryID uint32
+	// SubRepositoryPath holds the prefix where the subrepository
+	// was mounted.
+	SubRepositoryPath string `json:",omitempty"`
 
-	// RepositoryPriority is a Sourcegraph extension. It is used by Sourcegraph to
-	// order results from different repositories relative to each other.
-	RepositoryPriority float64
-
-	// Only set if requested
-	Content []byte
-
-	// Checksum of the content.
-	Checksum []byte
+	// Commit SHA1 (hex) of the (sub)repo holding the file.
+	Version string `json:",omitempty"`
 
 	// Detected language of the result.
 	Language string
 
-	// SubRepositoryName is the globally unique name of the repo,
-	// if it came from a subrepository
-	SubRepositoryName string
+	// For debugging. Needs DebugScore set, but public so tests in
+	// other packages can print some diagnostics.
+	Debug string `json:",omitempty"`
 
-	// SubRepositoryPath holds the prefix where the subrepository
-	// was mounted.
-	SubRepositoryPath string
+	Branches []string `json:",omitempty"`
 
-	// Commit SHA1 (hex) of the (sub)repo holding the file.
-	Version string
+	// One of LineMatches or ChunkMatches will be returned depending on whether
+	// the SearchOptions.ChunkMatches is set.
+	LineMatches  []LineMatch  `json:",omitempty"`
+	ChunkMatches []ChunkMatch `json:",omitempty"`
+
+	// Only set if requested
+	Content []byte `json:",omitempty"`
+
+	// Checksum of the content.
+	Checksum []byte
+
+	// Ranking; the higher, the better.
+	Score float64 `json:",omitempty"`
+
+	// RepositoryPriority is a Sourcegraph extension. It is used by Sourcegraph to
+	// order results from different repositories relative to each other.
+	RepositoryPriority float64 `json:",omitempty"`
+
+	// RepositoryID is a Sourcegraph extension. This is the ID of Repository in
+	// Sourcegraph.
+	RepositoryID uint32 `json:",omitempty"`
 }
 
 func (m *FileMatch) sizeBytes() (sz uint64) {
@@ -134,16 +138,11 @@ func (m *FileMatch) sizeBytes() (sz uint64) {
 // ChunkMatch is a set of non-overlapping matches within a contiguous range of
 // lines in the file.
 type ChunkMatch struct {
-	// Content is a contiguous range of complete lines that fully contains Ranges.
-	Content []byte
-	// ContentStart is the location (inclusive) of the beginning of content
-	// relative to the beginning of the file. It will always be at the
-	// beginning of a line (Column will always be 1).
-	ContentStart Location
+	DebugScore string
 
-	// FileName indicates whether this match is a match on the file name, in
-	// which case Content will contain the file name.
-	FileName bool
+	// Content is a contiguous range of complete lines that fully contains Ranges.
+	// Lines will always include their terminating newline (if it exists).
+	Content []byte
 
 	// Ranges is a set of matching ranges within this chunk. Each range is relative
 	// to the beginning of the file (not the beginning of Content).
@@ -153,8 +152,16 @@ type ChunkMatch struct {
 	// its length will equal that of Ranges. Any of its elements may be nil.
 	SymbolInfo []*Symbol
 
-	Score      float64
-	DebugScore string
+	// FileName indicates whether this match is a match on the file name, in
+	// which case Content will contain the file name.
+	FileName bool
+
+	// ContentStart is the location (inclusive) of the beginning of content
+	// relative to the beginning of the file. It will always be at the
+	// beginning of a line (Column will always be 1).
+	ContentStart Location
+
+	Score float64
 }
 
 func (cm *ChunkMatch) sizeBytes() (sz uint64) {
@@ -218,8 +225,12 @@ func (l *Location) sizeBytes() uint64 {
 // LineMatch holds the matches within a single line in a file.
 type LineMatch struct {
 	// The line in which a match was found.
-	Line       []byte
-	LineStart  int
+	Line []byte
+	// The byte offset of the first byte of the line.
+	LineStart int
+	// The byte offset of the first byte past the end of the line.
+	// This is usually the byte after the terminating newline, but can also be
+	// the end of the file if there is no terminating newline
 	LineEnd    int
 	LineNumber int
 
@@ -388,6 +399,14 @@ type Stats struct {
 	// Wall clock time for queued search.
 	Wait time.Duration
 
+	// Aggregate wall clock time spent constructing and pruning the match tree.
+	// This accounts for time such as lookups in the trigram index.
+	MatchTreeConstruction time.Duration
+
+	// Aggregate wall clock time spent searching the match tree. This accounts
+	// for the bulk of search work done looking for matches.
+	MatchTreeSearch time.Duration
+
 	// Number of times regexp was called on files that we evaluated.
 	RegexpsConsidered int
 
@@ -418,6 +437,8 @@ func (s *Stats) Add(o Stats) {
 	s.ShardsSkipped += o.ShardsSkipped
 	s.ShardsSkippedFilter += o.ShardsSkippedFilter
 	s.Wait += o.Wait
+	s.MatchTreeConstruction += o.MatchTreeConstruction
+	s.MatchTreeSearch += o.MatchTreeSearch
 	s.RegexpsConsidered += o.RegexpsConsidered
 
 	// We want the first non-zero FlushReason to be sticky. This is a useful
@@ -448,6 +469,8 @@ func (s *Stats) Zero() bool {
 		s.ShardsSkipped > 0 ||
 		s.ShardsSkippedFilter > 0 ||
 		s.Wait > 0 ||
+		s.MatchTreeConstruction > 0 ||
+		s.MatchTreeSearch > 0 ||
 		s.RegexpsConsidered > 0)
 }
 
@@ -612,7 +635,16 @@ func (r *Repository) UnmarshalJSON(data []byte) error {
 		r.ID = uint32(id)
 	}
 
-	if v, ok := repo.RawConfig["priority"]; ok {
+	// Sourcegraph indexserver doesn't set repo.Rank, so we set it here. Setting it
+	// on read instead of during indexing allows us to avoid a complete reindex.
+	//
+	// Prefer "latestCommitDate" over "priority" for ranking. We keep priority for
+	// backwards compatibility.
+	if _, ok := repo.RawConfig["latestCommitDate"]; ok {
+		// We use the number of months since 1970 as a simple measure of repo freshness.
+		// It is monotonically increasing and stable across re-indexes and restarts.
+		r.Rank = monthsSince1970(repo.LatestCommitDate)
+	} else if v, ok := repo.RawConfig["priority"]; ok {
 		r.priority, err = strconv.ParseFloat(v, 64)
 		if err != nil {
 			r.priority = 0
@@ -622,12 +654,26 @@ func (r *Repository) UnmarshalJSON(data []byte) error {
 		// based on priority. Setting it on read instead of during indexing
 		// allows us to avoid a complete reindex.
 		if r.Rank == 0 && r.priority > 0 {
-			// Normalize the repo score within [0, 1), with the midpoint at 5,000. This means popular
-			// repos (roughly ones with over 5,000 stars) see diminishing returns from more stars.
+			// Normalize the repo score within [0, maxUint16), with the midpoint at 5,000.
+			// This means popular repos (roughly ones with over 5,000 stars) see diminishing
+			// returns from more stars.
 			r.Rank = uint16(r.priority / (5000.0 + r.priority) * maxUInt16)
 		}
 	}
+
 	return nil
+}
+
+// monthsSince1970 returns the number of months since 1970. It returns values in
+// the range [0, maxUInt16]. The upper bound is reached in the year 7431, the
+// lower bound for all dates before 1970.
+func monthsSince1970(t time.Time) uint16 {
+	base := time.Unix(0, 0)
+	if t.Before(base) {
+		return 0
+	}
+	months := int(t.Year()-1970)*12 + int(t.Month()-1)
+	return uint16(min(months, maxUInt16))
 }
 
 // MergeMutable will merge x into r. mutated will be true if it made any
@@ -638,8 +684,6 @@ func (r *Repository) UnmarshalJSON(data []byte) error {
 //
 // Note: We ignore RawConfig fields which are duplicated into Repository:
 // name and id.
-//
-// Note: URL, *Template fields are ignored. They are not used by Sourcegraph.
 func (r *Repository) MergeMutable(x *Repository) (mutated bool, err error) {
 	if r.ID != x.ID {
 		// Sourcegraph: strange behaviour may occur if ID changes but names don't.
@@ -668,6 +712,23 @@ func (r *Repository) MergeMutable(x *Repository) (mutated bool, err error) {
 			mutated = true
 			r.RawConfig[k] = v
 		}
+	}
+
+	if r.URL != x.URL {
+		mutated = true
+		r.URL = x.URL
+	}
+	if r.CommitURLTemplate != x.CommitURLTemplate {
+		mutated = true
+		r.CommitURLTemplate = x.CommitURLTemplate
+	}
+	if r.FileURLTemplate != x.FileURLTemplate {
+		mutated = true
+		r.FileURLTemplate = x.FileURLTemplate
+	}
+	if r.LineFragmentTemplate != x.LineFragmentTemplate {
+		mutated = true
+		r.LineFragmentTemplate = x.LineFragmentTemplate
 	}
 
 	return mutated, nil
@@ -799,11 +860,6 @@ type RepoList struct {
 	// Returned when ListOptions.Field is RepoListFieldRepos.
 	Repos []*RepoListEntry
 
-	// Returned when ListOptions.Field is RepoListFieldMinimal.
-	//
-	// Deprecated: use ReposMap.
-	Minimal map[uint32]*MinimalRepoListEntry
-
 	// ReposMap is set when ListOptions.Field is RepoListFieldReposMap.
 	ReposMap ReposMap
 
@@ -830,16 +886,10 @@ type RepoListField int
 
 const (
 	RepoListFieldRepos    RepoListField = 0
-	RepoListFieldMinimal                = 1
 	RepoListFieldReposMap               = 2
 )
 
 type ListOptions struct {
-	// Return only Minimal data per repo that Sourcegraph frontend needs.
-	//
-	// Deprecated: use Field
-	Minimal bool
-
 	// Field decides which field to populate in RepoList response.
 	Field RepoListField
 }
@@ -848,13 +898,14 @@ func (o *ListOptions) GetField() (RepoListField, error) {
 	if o == nil {
 		return RepoListFieldRepos, nil
 	}
-	if o.Field < 0 || o.Field > RepoListFieldReposMap {
+	switch o.Field {
+	case RepoListFieldRepos, RepoListFieldReposMap:
+		return o.Field, nil
+	case 1:
+		return 0, fmt.Errorf("RepoListFieldMinimal (%d) is no longer supported", o.Field)
+	default:
 		return 0, fmt.Errorf("unknown RepoListField %d", o.Field)
 	}
-	if o.Minimal == true {
-		return RepoListFieldMinimal, nil
-	}
-	return o.Field, nil
 }
 
 func (o *ListOptions) String() string {
@@ -884,12 +935,6 @@ type SearchOptions struct {
 	// be set to 1 to find all repositories containing a result.
 	ShardRepoMaxMatchCount int
 
-	// Deprecated: this field is not read anymore.
-	ShardMaxImportantMatch int
-
-	// Deprecated: this field is not read anymore.
-	TotalMaxImportantMatch int
-
 	// Abort the search after this much time has passed.
 	MaxWallTime time.Duration
 
@@ -898,9 +943,12 @@ type SearchOptions struct {
 	// be sent and then the behaviour will revert to the normal streaming.
 	FlushWallTime time.Duration
 
-	// Trim the number of results after collating and sorting the
-	// results
+	// Truncates the number of documents (i.e. files) after collating and
+	// sorting the results.
 	MaxDocDisplayCount int
+
+	// Truncates the number of matchs after collating and sorting the results.
+	MaxMatchDisplayCount int
 
 	// If set to a number greater than zero then up to this many number
 	// of context lines will be added before and after each matched line.
@@ -921,10 +969,16 @@ type SearchOptions struct {
 	// will be used. This option is temporary and is only exposed for testing/ tuning purposes.
 	DocumentRanksWeight float64
 
-	// EXPERIMENTAL. If true, use keyword-style scoring instead of the default scoring formula.
-	// Currently, this treats each match in a file as a term and computes an approximation to BM25.
+	// EXPERIMENTAL. If true, use text-search style scoring instead of the default
+	// scoring formula. The scoring algorithm treats each match in a file as a term
+	// and computes an approximation to BM25.
+	//
+	// The calculation of IDF assumes that Zoekt visits all documents containing any
+	// of the query terms during evaluation. This is true, for example, if all query
+	// terms are ORed together.
+	//
 	// When enabled, all other scoring signals are ignored, including document ranks.
-	UseKeywordScoring bool
+	UseBM25Scoring bool
 
 	// Trace turns on opentracing for this request if true and if the Jaeger address was provided as
 	// a command-line flag
@@ -937,13 +991,83 @@ type SearchOptions struct {
 	SpanContext map[string]string
 }
 
+// String returns a succinct representation of the options. This is meant for
+// human consumption in logs and traces.
+//
+// Note: some tracing systems have limits on length of values, so we take care
+// to try and make this small, and include the important information near the
+// front incase of truncation.
 func (s *SearchOptions) String() string {
-	return fmt.Sprintf("%#v", s)
+	var b strings.Builder
+
+	add := func(name, value string) {
+		b.WriteString(name)
+		b.WriteByte('=')
+		b.WriteString(value)
+		b.WriteByte(' ')
+	}
+	addInt := func(name string, value int) {
+		if value != 0 {
+			add(name, strconv.Itoa(value))
+		}
+	}
+	addDuration := func(name string, value time.Duration) {
+		if value != 0 {
+			add(name, value.String())
+		}
+	}
+	addBool := func(name string, value bool) {
+		if !value {
+			return
+		}
+		b.WriteString(name)
+		b.WriteByte(' ')
+	}
+
+	b.WriteString("zoekt.SearchOptions{ ")
+
+	addInt("ShardMaxMatchCount", s.ShardMaxMatchCount)
+	addInt("TotalMaxMatchCount", s.TotalMaxMatchCount)
+	addInt("ShardRepoMaxMatchCount", s.ShardRepoMaxMatchCount)
+	addInt("MaxDocDisplayCount", s.MaxDocDisplayCount)
+	addInt("MaxMatchDisplayCount", s.MaxMatchDisplayCount)
+	addInt("NumContextLines", s.NumContextLines)
+
+	addDuration("MaxWallTime", s.MaxWallTime)
+	addDuration("FlushWallTime", s.FlushWallTime)
+
+	if s.DocumentRanksWeight > 0 {
+		add("DocumentRanksWeight", strconv.FormatFloat(s.DocumentRanksWeight, 'g', -1, 64))
+	}
+
+	addBool("EstimateDocCount", s.EstimateDocCount)
+	addBool("Whole", s.Whole)
+	addBool("ChunkMatches", s.ChunkMatches)
+	addBool("UseDocumentRanks", s.UseDocumentRanks)
+	addBool("UseBM25Scoring", s.UseBM25Scoring)
+	addBool("Trace", s.Trace)
+	addBool("DebugScore", s.DebugScore)
+
+	for k, v := range s.SpanContext {
+		add("SpanContext."+k, strconv.Quote(v))
+	}
+
+	b.WriteByte('}')
+	return b.String()
 }
 
 // Sender is the interface that wraps the basic Send method.
 type Sender interface {
 	Send(*SearchResult)
+}
+
+// SenderFunc is an adapter to allow the use of ordinary functions as Sender.
+// If f is a function with the appropriate signature, SenderFunc(f) is a Sender
+// that calls f.
+type SenderFunc func(result *SearchResult)
+
+func (f SenderFunc) Send(result *SearchResult) {
+	f(result)
 }
 
 // Streamer adds the method StreamSearch to the Searcher interface.

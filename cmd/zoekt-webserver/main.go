@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -35,9 +36,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"github.com/sourcegraph/mountinfo"
+	zoektgrpc "github.com/sourcegraph/zoekt/cmd/zoekt-webserver/grpc/server"
+	"github.com/sourcegraph/zoekt/grpc/internalerrs"
+	"github.com/sourcegraph/zoekt/grpc/messagesize"
+	proto "github.com/sourcegraph/zoekt/grpc/protos/zoekt/webserver/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -46,13 +53,10 @@ import (
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/debugserver"
-	zoektgrpc "github.com/sourcegraph/zoekt/grpc"
-	v1 "github.com/sourcegraph/zoekt/grpc/v1"
 	"github.com/sourcegraph/zoekt/internal/profiler"
 	"github.com/sourcegraph/zoekt/internal/tracer"
 	"github.com/sourcegraph/zoekt/query"
 	"github.com/sourcegraph/zoekt/shards"
-	"github.com/sourcegraph/zoekt/stream"
 	"github.com/sourcegraph/zoekt/trace"
 	"github.com/sourcegraph/zoekt/web"
 
@@ -173,7 +177,7 @@ func main() {
 	liblog := sglog.Init(resource)
 	defer liblog.Sync()
 	tracer.Init(resource)
-	profiler.Init("zoekt-webserver", zoekt.Version, -1)
+	profiler.Init("zoekt-webserver")
 
 	if *logDir != "" {
 		if fi, err := os.Lstat(*logDir); err != nil || !fi.IsDir() {
@@ -194,7 +198,7 @@ func main() {
 
 	mustRegisterDiskMonitor(*index)
 
-	metricsLogger := sglog.Scoped("metricsRegistration", "")
+	metricsLogger := sglog.Scoped("metricsRegistration")
 
 	mustRegisterMemoryMapMetrics(metricsLogger)
 
@@ -213,7 +217,7 @@ func main() {
 
 	searcher = &loggedSearcher{
 		Streamer: searcher,
-		Logger:   sglog.Scoped("searcher", ""),
+		Logger:   sglog.Scoped("searcher"),
 	}
 
 	s := &web.Server{
@@ -256,7 +260,7 @@ func main() {
 
 	if *enableIndexserverProxy {
 		socket := filepath.Join(*index, "indexserver.sock")
-		sglog.Scoped("server", "").Info("adding reverse proxy", sglog.String("socket", socket))
+		sglog.Scoped("server").Info("adding reverse proxy", sglog.String("socket", socket))
 		addProxyHandler(serveMux, socket)
 	}
 
@@ -288,11 +292,10 @@ func main() {
 		log.Println("watchdog disabled")
 	}
 
-	grpcServer := grpc.NewServer(
-		grpc.StreamInterceptor(otelgrpc.StreamServerInterceptor()),
-		grpc.UnaryInterceptor(otelgrpc.UnaryServerInterceptor()),
-	)
-	v1.RegisterWebserverServiceServer(grpcServer, zoektgrpc.NewServer(web.NewTraceAwareSearcher(s.Searcher)))
+	logger := sglog.Scoped("ZoektWebserverGRPCServer")
+
+	streamer := web.NewTraceAwareSearcher(s.Searcher)
+	grpcServer := newGRPCServer(logger, streamer)
 
 	handler = multiplexGRPC(grpcServer, handler)
 
@@ -302,7 +305,7 @@ func main() {
 	}
 
 	go func() {
-		sglog.Scoped("server", "").Info("starting server", sglog.Stringp("address", listen))
+		sglog.Scoped("server").Info("starting server", sglog.Stringp("address", listen))
 		var err error
 		if *sslCert != "" || *sslKey != "" {
 			err = srv.ListenAndServeTLS(*sslCert, *sslKey)
@@ -435,9 +438,11 @@ func watchdogOnce(ctx context.Context, client *http.Client, addr string) error {
 	if err != nil {
 		return err
 	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("watchdog: status %v", resp.StatusCode)
+		return fmt.Errorf("watchdog: status=%v body=%q", resp.StatusCode, string(body))
 	}
 	return nil
 }
@@ -459,7 +464,15 @@ func watchdog(dt time.Duration, maxErrCount int, addr string) {
 			metricWatchdogErrors.Set(float64(errCount))
 			metricWatchdogErrorsTotal.Inc()
 			if errCount >= maxErrCount {
-				log.Panicf("watchdog: %v", err)
+				log.Printf(`watchdog health check has consecutively failed %d times indicating is likely an unrecoverable error affecting zoekt. As such this process will exit with code 3.
+
+Final error: %v
+
+Possible remediations:
+- If this rarely happens, ignore and let your process manager restart zoekt.
+- Possibly under provisioned. Try increasing CPU or disk IO.
+- A bug. Reach out with logs and screenshots of metrics when this occurs.`, errCount, err)
+				os.Exit(3)
 			} else {
 				log.Printf("watchdog: failed, will try %d more times: %v", maxErrCount-errCount, err)
 			}
@@ -537,12 +550,10 @@ func (s *loggedSearcher) StreamSearch(
 	opts *zoekt.SearchOptions,
 	sender zoekt.Sender,
 ) error {
-	var (
-		stats zoekt.Stats
-	)
+	var stats zoekt.Stats
 
 	metricSearchRequestsTotal.Inc()
-	err := s.Streamer.StreamSearch(ctx, q, opts, stream.SenderFunc(func(event *zoekt.SearchResult) {
+	err := s.Streamer.StreamSearch(ctx, q, opts, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 		stats.Add(event.Stats)
 		sender.Send(event)
 	}))
@@ -563,6 +574,7 @@ func (s *loggedSearcher) log(ctx context.Context, q query.Q, opts *zoekt.SearchO
 			sglog.Int("opts.TotalMaxMatchCount", opts.TotalMaxMatchCount),
 			sglog.Duration("opts.MaxWallTime", opts.MaxWallTime),
 			sglog.Int("opts.MaxDocDisplayCount", opts.MaxDocDisplayCount),
+			sglog.Int("opts.MaxMatchDisplayCount", opts.MaxMatchDisplayCount),
 		)
 
 	if err != nil {
@@ -598,6 +610,8 @@ func (s *loggedSearcher) log(ctx context.Context, q query.Q, opts *zoekt.SearchO
 		sglog.Int("stat.NgramMatches", st.NgramMatches),
 		sglog.Int("stat.NgramLookups", st.NgramLookups),
 		sglog.Duration("stat.Wait", st.Wait),
+		sglog.Duration("stat.MatchTreeConstruction", st.MatchTreeConstruction),
+		sglog.Duration("stat.MatchTreeSearch", st.MatchTreeSearch),
 		sglog.Int("stat.RegexpsConsidered", st.RegexpsConsidered),
 		sglog.String("stat.FlushReason", st.FlushReason.String()),
 	)
@@ -624,6 +638,39 @@ func traceContext(ctx context.Context) sglog.TraceContext {
 	return sglog.TraceContext{}
 }
 
+func newGRPCServer(logger sglog.Logger, streamer zoekt.Streamer, additionalOpts ...grpc.ServerOption) *grpc.Server {
+	metrics := serverMetricsOnce()
+
+	opts := []grpc.ServerOption{
+		grpc.ChainStreamInterceptor(
+			otelgrpc.StreamServerInterceptor(),
+			metrics.StreamServerInterceptor(),
+			messagesize.StreamServerInterceptor,
+			internalerrs.LoggingStreamServerInterceptor(logger),
+		),
+		grpc.ChainUnaryInterceptor(
+			otelgrpc.UnaryServerInterceptor(),
+			metrics.UnaryServerInterceptor(),
+			messagesize.UnaryServerInterceptor,
+			internalerrs.LoggingUnaryServerInterceptor(logger),
+		),
+	}
+
+	opts = append(opts, additionalOpts...)
+
+	// Ensure that the message size options are set last, so they override any other
+	// server-specific options that tweak the message size.
+	//
+	// The message size options are only provided if the environment variable is set. These options serve as an escape hatch, so they
+	// take precedence over everything else with a uniform size setting that's easy to reason about.
+	opts = append(opts, messagesize.MustGetServerMessageSizeFromEnv()...)
+
+	s := grpc.NewServer(opts...)
+	proto.RegisterWebserverServiceServer(s, zoektgrpc.NewServer(streamer))
+
+	return s
+}
+
 var (
 	metricWatchdogErrors = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "zoekt_webserver_watchdog_errors",
@@ -640,5 +687,19 @@ var (
 	metricSearchRequestsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "zoekt_search_requests_total",
 		Help: "The total number of search requests that zoekt received",
+	})
+
+	// serviceMetricsOnce returns a singleton instance of the server metrics
+	// that are shared across all gRPC servers that this process creates.
+	//
+	// This function panics if the metrics cannot be registered with the default
+	// Prometheus registry.
+	serverMetricsOnce = sync.OnceValue(func() *grpcprom.ServerMetrics {
+		serverMetrics := grpcprom.NewServerMetrics(
+			grpcprom.WithServerCounterOptions(),
+			grpcprom.WithServerHandlingTimeHistogram(), // record the overall response latency for a gRPC request)
+		)
+		prometheus.DefaultRegisterer.MustRegister(serverMetrics)
+		return serverMetrics
 	})
 )

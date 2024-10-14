@@ -43,6 +43,7 @@ import (
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/gitindex"
+	"github.com/sourcegraph/zoekt/ignore"
 	"go.uber.org/automaxprocs/maxprocs"
 
 	git "github.com/go-git/go-git/v5"
@@ -193,7 +194,7 @@ func main() {
 		}
 
 		perBranch[br.branch] = files
-		for key, loc := range files {
+		for key, repo := range files {
 			_, ok := opts.SubRepositories[key.SubRepoPath]
 			if ok {
 				// This can be incorrect: if the layout of manifests
@@ -204,8 +205,8 @@ func main() {
 			}
 
 			desc := &zoekt.Repository{}
-			if err := gitindex.SetTemplatesFromOrigin(desc, loc.URL); err != nil {
-				log.Fatalf("SetTemplatesFromOrigin(%s): %v", loc.URL, err)
+			if err := gitindex.SetTemplatesFromOrigin(desc, repo.URL); err != nil {
+				log.Fatalf("SetTemplatesFromOrigin(%s): %v", repo.URL, err)
 			}
 
 			opts.SubRepositories[key.SubRepoPath] = desc
@@ -324,7 +325,8 @@ func getManifest(repo *git.Repository, branch, path string) (*manifest.Manifest,
 // iterateManifest constructs a complete tree from the given Manifest.
 func iterateManifest(mf *manifest.Manifest,
 	baseURL url.URL, revPrefix string,
-	cache *gitindex.RepoCache) (map[fileKey]gitindex.BlobLocation, map[string]plumbing.Hash, error) {
+	cache *gitindex.RepoCache,
+) (map[fileKey]gitindex.BlobLocation, map[string]plumbing.Hash, error) {
 	allFiles := map[fileKey]gitindex.BlobLocation{}
 	allVersions := map[string]plumbing.Hash{}
 	for _, p := range mf.Project {
@@ -358,12 +360,13 @@ func iterateManifest(mf *manifest.Manifest,
 			return nil, nil, err
 		}
 
-		files, versions, err := gitindex.TreeToFiles(topRepo, tree, projURL.String(), cache)
+		rw := gitindex.NewRepoWalker(topRepo, projURL.String(), cache)
+		subVersions, err := rw.CollectFiles(tree, rev, &ignore.Matcher{})
 		if err != nil {
 			return nil, nil, err
 		}
 
-		for key, repo := range files {
+		for key, repo := range rw.Files {
 			allFiles[fileKey{
 				SubRepoPath: filepath.Join(p.GetPath(), key.SubRepoPath),
 				Path:        key.Path,
@@ -371,7 +374,7 @@ func iterateManifest(mf *manifest.Manifest,
 			}] = repo
 		}
 
-		for path, version := range versions {
+		for path, version := range subVersions {
 			allVersions[filepath.Join(p.GetPath(), path)] = version
 		}
 	}

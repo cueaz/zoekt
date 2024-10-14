@@ -29,6 +29,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/grafana/regexp"
+	"github.com/sourcegraph/zoekt/ignore"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
@@ -139,7 +140,7 @@ func TestFindGitRepos(t *testing.T) {
 	}
 }
 
-func TestTreeToFiles(t *testing.T) {
+func TestCollectFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	if err := createSubmoduleRepo(dir); err != nil {
@@ -168,9 +169,10 @@ func TestTreeToFiles(t *testing.T) {
 		t.Fatalf("AsTree: %v", err)
 	}
 
-	files, versions, err := TreeToFiles(repo, tree, aURL.String(), cache)
+	rw := NewRepoWalker(repo, aURL.String(), cache)
+	versions, err := rw.CollectFiles(tree, "main", &ignore.Matcher{})
 	if err != nil {
-		t.Fatalf("TreeToFiles: %v", err)
+		t.Fatalf("CollectFiles: %v", err)
 	}
 
 	bnameHash := versions["bname"]
@@ -181,7 +183,7 @@ func TestTreeToFiles(t *testing.T) {
 	}
 
 	var paths []string
-	for k := range files {
+	for k := range rw.Files {
 		paths = append(paths, k.FullPath())
 	}
 	sort.Strings(paths)
@@ -213,7 +215,7 @@ func TestSubmoduleIndex(t *testing.T) {
 		Incremental:  true,
 		RepoCacheDir: dir,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 
@@ -317,7 +319,7 @@ func TestSearchSymlinkByContent(t *testing.T) {
 		Incremental:  true,
 		RepoCacheDir: dir,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 
@@ -375,11 +377,11 @@ func TestAllowMissingBranch(t *testing.T) {
 		Incremental:  true,
 		RepoCacheDir: dir,
 	}
-	if err := IndexGitRepo(opts); err == nil {
+	if _, err := IndexGitRepo(opts); err == nil {
 		t.Fatalf("IndexGitRepo(nonexist) succeeded")
 	}
 	opts.AllowMissingBranch = true
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo(nonexist, allow): %v", err)
 	}
 }
@@ -444,7 +446,7 @@ func TestBranchWildcard(t *testing.T) {
 		Submodules:   true,
 		Incremental:  true,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 
@@ -492,7 +494,7 @@ func TestSkipSubmodules(t *testing.T) {
 		Branches:     []string{"master"},
 		Submodules:   false,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 }
@@ -523,7 +525,7 @@ func TestFullAndShortRefNames(t *testing.T) {
 		Incremental:        false,
 		AllowMissingBranch: false,
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 
@@ -573,7 +575,7 @@ func TestLatestCommit(t *testing.T) {
 		BranchPrefix: "refs/heads",
 		Branches:     []string{"branchdir/a", "branchdir/b"},
 	}
-	if err := IndexGitRepo(opts); err != nil {
+	if _, err := IndexGitRepo(opts); err != nil {
 		t.Fatalf("IndexGitRepo: %v", err)
 	}
 

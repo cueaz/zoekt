@@ -28,14 +28,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	texttemplate "text/template"
 	"time"
 
 	"github.com/grafana/regexp"
 	"github.com/sourcegraph/zoekt"
 	zjson "github.com/sourcegraph/zoekt/json"
 	"github.com/sourcegraph/zoekt/query"
-	"github.com/sourcegraph/zoekt/rpc"
-	"github.com/sourcegraph/zoekt/stream"
 )
 
 var Funcmap = template.FuncMap{
@@ -72,6 +71,9 @@ var Funcmap = template.FuncMap{
 			return post
 		}
 		return fmt.Sprintf("%s...(%d bytes skipped)...", post[:limit], len(post)-limit)
+	},
+	"TrimTrailingNewline": func(s string) string {
+		return strings.TrimSuffix(s, "\n")
 	},
 }
 
@@ -115,8 +117,9 @@ type Server struct {
 
 	startTime time.Time
 
-	templateMu    sync.Mutex
-	templateCache map[string]*template.Template
+	templateMu        sync.Mutex
+	templateCache     map[string]*template.Template
+	textTemplateCache map[string]*texttemplate.Template
 
 	lastStatsMu sync.Mutex
 	lastStats   *zoekt.RepoStats
@@ -133,10 +136,27 @@ func (s *Server) getTemplate(str string) *template.Template {
 
 	t, err := template.New("cache").Parse(str)
 	if err != nil {
-		log.Printf("template parse error: %v", err)
+		log.Printf("html template parse error: %v", err)
 		t = template.Must(template.New("empty").Parse(""))
 	}
 	s.templateCache[str] = t
+	return t
+}
+
+func (s *Server) getTextTemplate(str string) *texttemplate.Template {
+	s.templateMu.Lock()
+	defer s.templateMu.Unlock()
+	t := s.textTemplateCache[str]
+	if t != nil {
+		return t
+	}
+
+	t, err := zoekt.ParseTemplate(str)
+	if err != nil {
+		log.Printf("text template parse error: %v", err)
+		t = texttemplate.Must(texttemplate.New("empty").Parse(""))
+	}
+	s.textTemplateCache[str] = t
 	return t
 }
 
@@ -161,6 +181,7 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	}
 
 	s.templateCache = map[string]*template.Template{}
+	s.textTemplateCache = map[string]*texttemplate.Template{}
 	s.startTime = time.Now()
 
 	mux := http.NewServeMux()
@@ -173,9 +194,7 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 		mux.HandleFunc("/print", s.servePrint)
 	}
 	if s.RPC {
-		mux.Handle(rpc.DefaultRPCPath, rpc.Server(traceAwareSearcher{s.Searcher})) // /rpc
 		mux.Handle("/api/", http.StripPrefix("/api", zjson.JSONServer(traceAwareSearcher{s.Searcher})))
-		mux.Handle(stream.DefaultSSEPath, stream.Server(traceAwareSearcher{s.Searcher})) // /stream
 	}
 
 	mux.HandleFunc("/healthz", s.serveHealthz)
@@ -274,12 +293,10 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 	}
 
 	numCtxLines := 0
-	if qvals.Get("format") == "json" {
-		if ctxLinesStr := qvals.Get("ctx"); ctxLinesStr != "" {
-			numCtxLines, err = strconv.Atoi(ctxLinesStr)
-			if err != nil || numCtxLines < 0 || numCtxLines > 10 {
-				return nil, fmt.Errorf("Number of context lines must be between 0 and 10")
-			}
+	if ctxLinesStr := qvals.Get("ctx"); ctxLinesStr != "" {
+		numCtxLines, err = strconv.Atoi(ctxLinesStr)
+		if err != nil || numCtxLines < 0 || numCtxLines > 10 {
+			return nil, fmt.Errorf("Number of context lines must be between 0 and 10")
 		}
 	}
 	sOpts.NumContextLines = numCtxLines
@@ -307,6 +324,7 @@ func (s *Server) serveSearchErr(r *http.Request) (*ApiSearchResult, error) {
 		Last: LastInput{
 			Query:     queryStr,
 			Num:       num,
+			Ctx:       numCtxLines,
 			AutoFocus: true,
 		},
 		Stats:       result.Stats,
@@ -512,7 +530,7 @@ func (s *Server) serveListReposErr(q query.Q, qStr string, r *http.Request) (*Re
 	}
 
 	for _, r := range repos.Repos {
-		t := s.getTemplate(r.Repository.CommitURLTemplate)
+		t := s.getTextTemplate(r.Repository.CommitURLTemplate)
 
 		repo := Repository{
 			Name:       r.Repository.Name,
@@ -556,7 +574,6 @@ func (s *Server) servePrintErr(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	repoRe, err := regexp.Compile("^" + regexp.QuoteMeta(repoStr) + "$")
-
 	if err != nil {
 		return err
 	}

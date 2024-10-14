@@ -17,7 +17,11 @@ package build
 import (
 	"bytes"
 	"fmt"
+	"log"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/ctags"
@@ -37,25 +41,36 @@ func normalizeLanguage(filetype string) string {
 	return normalized
 }
 
-func ctagsAddSymbolsParserMap(todo []*zoekt.Document, languageMap ctags.LanguageMap, parserMap ctags.ParserMap) error {
+func parseSymbols(todo []*zoekt.Document, languageMap ctags.LanguageMap, parserBins ctags.ParserBinMap) error {
+	monitor := newMonitor()
+	defer monitor.Stop()
+
+	var tagsToSections tagsToSections
+
+	parser := ctags.NewCTagsParser(parserBins)
+	defer parser.Close()
+
 	for _, doc := range todo {
-		if doc.Symbols != nil {
+		if len(doc.Content) == 0 || doc.Symbols != nil {
 			continue
 		}
 
 		zoekt.DetermineLanguageIfUnknown(doc)
 
-		parserKind := languageMap[normalizeLanguage(doc.Language)]
-		if parserKind == ctags.NoCTags {
+		parserType := languageMap[normalizeLanguage(doc.Language)]
+		if parserType == ctags.NoCTags {
 			continue
 		}
 
-		parser := parserMap[parserKind]
-		if parser == nil {
-			parser = parserMap[ctags.UniversalCTags]
+		// If the parser type is unknown, default to universal-ctags
+		if parserType == ctags.UnknownCTags {
+			parserType = ctags.UniversalCTags
 		}
 
-		es, err := parser.Parse(doc.Name, doc.Content)
+		monitor.BeginParsing(doc)
+		es, err := parser.Parse(doc.Name, doc.Content, parserType)
+		monitor.EndParsing(es)
+
 		if err != nil {
 			return err
 		}
@@ -63,7 +78,7 @@ func ctagsAddSymbolsParserMap(todo []*zoekt.Document, languageMap ctags.Language
 			continue
 		}
 
-		symOffsets, symMetaData, err := tagsToSections(doc.Content, es)
+		symOffsets, symMetaData, err := tagsToSections.Convert(doc.Content, es)
 		if err != nil {
 			return fmt.Errorf("%s: %v", doc.Name, err)
 		}
@@ -94,13 +109,21 @@ func overlaps(symOffsets []zoekt.DocumentSection, start, end uint32) int {
 	return i + 1
 }
 
-// tagsToSections converts ctags entries to byte ranges (zoekt.DocumentSection)
-// with corresponding metadata (zoekt.Symbol).
-func tagsToSections(content []byte, tags []*ctags.Entry) ([]zoekt.DocumentSection, []*zoekt.Symbol, error) {
-	nls := newLinesIndices(content)
-	nls = append(nls, uint32(len(content)))
-	var symOffsets []zoekt.DocumentSection
-	var symMetaData []*zoekt.Symbol
+// tagsToSections contains buffers to be reused between conversions of bytes
+// ranges to metadata. This is done to reduce pressure on the garbage
+// collector.
+type tagsToSections struct {
+	nlsBuf []uint32
+}
+
+// Convert ctags entries to byte ranges (zoekt.DocumentSection) with
+// corresponding metadata (zoekt.Symbol).
+//
+// This can not be called concurrently.
+func (t *tagsToSections) Convert(content []byte, tags []*ctags.Entry) ([]zoekt.DocumentSection, []*zoekt.Symbol, error) {
+	nls := t.newLinesIndices(content)
+	symOffsets := make([]zoekt.DocumentSection, 0, len(tags))
+	symMetaData := make([]*zoekt.Symbol, 0, len(tags))
 
 	for _, t := range tags {
 		if t.Line <= 0 {
@@ -109,7 +132,8 @@ func tagsToSections(content []byte, tags []*ctags.Entry) ([]zoekt.DocumentSectio
 		}
 		lineIdx := t.Line - 1
 		if lineIdx >= len(nls) {
-			return nil, nil, fmt.Errorf("linenum for entry out of range %v", t)
+			// Observed this with a .TS file.
+			continue
 		}
 
 		lineOff := uint32(0)
@@ -138,28 +162,156 @@ func tagsToSections(content []byte, tags []*ctags.Entry) ([]zoekt.DocumentSectio
 			continue
 		}
 
-		symOffsets = append(
-			symOffsets[:i],
-			append([]zoekt.DocumentSection{{Start: start, End: endSym}}, symOffsets[i:]...)...,
-		)
-		symMetaData = append(
-			symMetaData[:i],
-			append(
-				[]*zoekt.Symbol{{Sym: t.Name, Kind: t.Kind, Parent: t.Parent, ParentKind: t.ParentKind}},
-				symMetaData[i:]...,
-			)...,
-		)
+		symOffsets = slices.Insert(symOffsets, i, zoekt.DocumentSection{
+			Start: start,
+			End:   endSym,
+		})
+		symMetaData = slices.Insert(symMetaData, i, &zoekt.Symbol{
+			Sym:        t.Name,
+			Kind:       t.Kind,
+			Parent:     t.Parent,
+			ParentKind: t.ParentKind,
+		})
 	}
 
 	return symOffsets, symMetaData, nil
 }
 
-func newLinesIndices(in []byte) []uint32 {
-	out := make([]uint32, 0, len(in)/30)
-	for i, c := range in {
-		if c == '\n' {
-			out = append(out, uint32(i))
+// newLinesIndices returns an array of all indexes of '\n' aswell as a final
+// value for the length of the document.
+func (t *tagsToSections) newLinesIndices(in []byte) []uint32 {
+	// reuse nlsBuf between calls to tagsToSections.Convert
+	out := t.nlsBuf
+	if out == nil {
+		out = make([]uint32, 0, len(in)/30)
+	}
+
+	finalEntry := uint32(len(in))
+	off := uint32(0)
+	for len(in) > 0 {
+		i := bytes.IndexByte(in, '\n')
+		if i < 0 {
+			out = append(out, finalEntry)
+			break
+		}
+
+		off += uint32(i)
+		out = append(out, off)
+
+		in = in[i+1:]
+		off++
+	}
+
+	// save buffer for reuse
+	t.nlsBuf = out[:0]
+
+	return out
+}
+
+// monitorReportStuck is how long we need to be analysing a document before
+// reporting it to stdout.
+const monitorReportStuck = 10 * time.Second
+
+// monitorReportStatus is how often we given status updates
+const monitorReportStatus = time.Minute
+
+type monitor struct {
+	mu sync.Mutex
+
+	lastUpdate time.Time
+
+	start        time.Time
+	totalSize    int
+	totalSymbols int
+
+	currentDocName       string
+	currentDocSize       int
+	currentDocStuckCount int
+
+	done chan struct{}
+}
+
+func newMonitor() *monitor {
+	start := time.Now()
+	m := &monitor{
+		start:      start,
+		lastUpdate: start,
+		done:       make(chan struct{}),
+	}
+	go m.run()
+	return m
+}
+
+func (m *monitor) BeginParsing(doc *zoekt.Document) {
+	now := time.Now()
+	m.mu.Lock()
+	m.lastUpdate = now
+
+	// set current doc
+	m.currentDocName = doc.Name
+	m.currentDocSize = len(doc.Content)
+
+	m.mu.Unlock()
+}
+
+func (m *monitor) EndParsing(entries []*ctags.Entry) {
+	now := time.Now()
+	m.mu.Lock()
+	m.lastUpdate = now
+
+	// update aggregate stats
+	m.totalSize += m.currentDocSize
+	m.totalSymbols += len(entries)
+
+	// inform done if we warned about current document
+	if m.currentDocStuckCount > 0 {
+		log.Printf("symbol analysis for %s (size %d bytes) is done and found %d symbols", m.currentDocName, m.currentDocSize, len(entries))
+		m.currentDocStuckCount = 0
+	}
+
+	// unset current document
+	m.currentDocName = ""
+	m.currentDocSize = 0
+
+	m.mu.Unlock()
+}
+
+func (m *monitor) Stop() {
+	close(m.done)
+}
+
+func (m *monitor) run() {
+	stuckTicker := time.NewTicker(monitorReportStuck / 2) // half due to sampling theorem (nyquist)
+	statusTicker := time.NewTicker(monitorReportStatus)
+
+	defer stuckTicker.Stop()
+	defer statusTicker.Stop()
+
+	for {
+		select {
+		case <-m.done:
+			now := time.Now()
+			m.mu.Lock()
+			log.Printf("symbol analysis finished for shard statistics: duration=%v symbols=%d bytes=%d", now.Sub(m.start).Truncate(time.Second), m.totalSymbols, m.totalSize)
+			m.mu.Unlock()
+			return
+
+		case <-stuckTicker.C:
+			now := time.Now()
+			m.mu.Lock()
+			running := now.Sub(m.lastUpdate).Truncate(time.Second)
+			report := monitorReportStuck * (1 << m.currentDocStuckCount) // double the amount of time each time we report
+			if m.currentDocName != "" && running >= report {
+				m.currentDocStuckCount++
+				log.Printf("WARN: symbol analysis for %s (%d bytes) has been running for %v", m.currentDocName, m.currentDocSize, running)
+			}
+			m.mu.Unlock()
+
+		case <-statusTicker.C:
+			now := time.Now()
+			m.mu.Lock()
+			log.Printf("DEBUG: symbol analysis still running for shard statistics: duration=%v symbols=%d bytes=%d", now.Sub(m.start).Truncate(time.Second), m.totalSymbols, m.totalSize)
+			m.mu.Unlock()
 		}
 	}
-	return out
 }

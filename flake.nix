@@ -18,18 +18,20 @@
       in { default = import ./shell.nix { inherit pkgs; }; });
     # Pin a specific version of universal-ctags to the same version as in cmd/symbols/ctags-install-alpine.sh.
     overlays.ctags = self: super: rec {
-      universal-ctags = super.universal-ctags.overrideAttrs (old: {
-        version = "5.9.20220403.0";
+      my-universal-ctags = super.universal-ctags.overrideAttrs (old: rec {
+        version = "6.1.0";
         src = super.fetchFromGitHub {
           owner = "universal-ctags";
           repo = "ctags";
-          rev = "f95bb3497f53748c2b6afc7f298cff218103ab90";
-          sha256 = "sha256-pd89KERQj6K11Nue3YFNO+NLOJGqcMnHkeqtWvMFk38=";
+          rev = "v${version}";
+          sha256 = "sha256-f8+Ifjn7bhSYozOy7kn+zCLdHGrH3iFupHUZEGynz9Y=";
         };
         # disable checks, else we get `make[1]: *** No rule to make target 'optlib/cmake.c'.  Stop.`
         doCheck = false;
         checkFlags = [ ];
       });
+      # Skip building if same ctags version as registry
+      universal-ctags = if super.universal-ctags.version == my-universal-ctags.version then super.universal-ctags else my-universal-ctags;
     };
   };
 }

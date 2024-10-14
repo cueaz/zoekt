@@ -50,6 +50,9 @@ type ConfigEntry struct {
 	ExcludeTopics          []string
 	Active                 bool
 	NoArchived             bool
+	GerritFetchMetaConfig  bool
+	GerritRepoNameFormat   string
+	ExcludeUserRepos       bool
 }
 
 func randomize(entries []ConfigEntry) []ConfigEntry {
@@ -241,6 +244,9 @@ func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- string
 			if c.OnlyPublic {
 				cmd.Args = append(cmd.Args, "-public")
 			}
+			if c.ExcludeUserRepos {
+				cmd.Args = append(cmd.Args, "-exclude_user")
+			}
 			if c.CredentialPath != "" {
 				cmd.Args = append(cmd.Args, "-token", c.CredentialPath)
 			}
@@ -258,6 +264,12 @@ func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- string
 			}
 			if c.Active {
 				cmd.Args = append(cmd.Args, "-active")
+			}
+			if c.GerritFetchMetaConfig {
+				cmd.Args = append(cmd.Args, "-fetch-meta-config")
+			}
+			if c.GerritRepoNameFormat != "" {
+				cmd.Args = append(cmd.Args, "-repo-name-format", c.GerritRepoNameFormat)
 			}
 			cmd.Args = append(cmd.Args, c.GerritApiURL)
 		} else {

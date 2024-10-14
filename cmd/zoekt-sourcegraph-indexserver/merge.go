@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -13,12 +12,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/atomic"
-	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/sourcegraph/zoekt"
 )
-
-var reCompound = regexp.MustCompile(`compound-.*\.zoekt`)
 
 var metricShardMergingRunning = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "index_shard_merging_running",
@@ -59,7 +55,6 @@ func (s *Server) doMerge() {
 
 // same as doMerge but with a configurable merge command.
 func (s *Server) merge(mergeCmd func(args ...string) *exec.Cmd) {
-
 	// Guard against the user triggering competing merge jobs with the debug
 	// command.
 	if !mergeRunning.CompareAndSwap(false, true) {
@@ -70,12 +65,6 @@ func (s *Server) merge(mergeCmd func(args ...string) *exec.Cmd) {
 
 	metricShardMergingRunning.Set(1)
 	defer metricShardMergingRunning.Set(0)
-
-	wc := &lumberjack.Logger{
-		Filename:   filepath.Join(s.IndexDir, "zoekt-merge-log.tsv"),
-		MaxSize:    100, // Megabyte
-		MaxBackups: 5,
-	}
 
 	// We keep creating compound shards until we run out of shards to merge or until
 	// we encounter an error during merging.
@@ -105,12 +94,6 @@ func (s *Server) merge(mergeCmd func(args ...string) *exec.Cmd) {
 			if err != nil {
 				log.Printf("mergeCmd: out=%s, err=%s", out, err)
 				return
-			}
-
-			newCompoundName := reCompound.Find(out)
-			now := time.Now()
-			for _, s := range c.shards {
-				_, _ = fmt.Fprintf(wc, "%s\t%s\t%s\t%s\n", now.UTC().Format(time.RFC3339), "merge", filepath.Base(s.path), string(newCompoundName))
 			}
 
 			next = true
@@ -197,9 +180,6 @@ type mergeOpts struct {
 	// merging. For example, a value of 7 means that only repos that have been
 	// inactive for 7 days will be considered for merging.
 	minAgeDays int
-
-	// the MAX priority a shard can have to be considered for merging.
-	maxPriority float64
 }
 
 // isExcluded returns true if a shard should not be merged, false otherwise.
@@ -227,10 +207,6 @@ func isExcluded(path string, fi os.FileInfo, opts mergeOpts) bool {
 	}
 
 	if repos[0].LatestCommitDate.After(time.Now().AddDate(0, 0, -opts.minAgeDays)) {
-		return true
-	}
-
-	if priority, err := strconv.ParseFloat(repos[0].RawConfig["priority"], 64); err == nil && priority > opts.maxPriority {
 		return true
 	}
 

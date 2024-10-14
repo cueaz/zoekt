@@ -9,16 +9,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/stream"
 )
 
-var (
-	metricFinalAggregateSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "zoekt_final_aggregate_size",
-		Help:    "The number of file matches we aggregated before flushing",
-		Buckets: prometheus.ExponentialBuckets(1, 2, 20),
-	}, []string{"reason"})
-)
+var metricFinalAggregateSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "zoekt_final_aggregate_size",
+	Help:    "The number of file matches we aggregated before flushing",
+	Buckets: prometheus.ExponentialBuckets(1, 2, 20),
+}, []string{"reason"})
 
 // collectSender is a sender that will aggregate results. Once sending is
 // done, you call Done to return the aggregated result which are ranked.
@@ -49,10 +46,7 @@ func (c *collectSender) Send(r *zoekt.SearchResult) {
 	if len(r.Files) > 0 {
 		c.aggregate.Files = append(c.aggregate.Files, r.Files...)
 
-		zoekt.SortFiles(c.aggregate.Files)
-		if max := c.opts.MaxDocDisplayCount; max > 0 && max < len(c.aggregate.Files) {
-			c.aggregate.Files = c.aggregate.Files[:max]
-		}
+		c.aggregate.Files = zoekt.SortAndTruncateFiles(c.aggregate.Files, c.opts)
 
 		for k, v := range r.RepoURLs {
 			c.aggregate.RepoURLs[k] = v
@@ -143,7 +137,7 @@ func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender) (zoek
 		stopCollectingAndFlush(zoekt.FlushReasonFinalFlush)
 	}
 
-	return stream.SenderFunc(func(event *zoekt.SearchResult) {
+	return zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 		mu.Lock()
 		if collectSender != nil {
 			collectSender.Send(event)
@@ -154,21 +148,21 @@ func newFlushCollectSender(opts *zoekt.SearchOptions, sender zoekt.Sender) (zoek
 	}), finalFlush
 }
 
-// limitSender wraps a sender and calls cancel once it has seen limit file
-// matches.
-func limitSender(cancel context.CancelFunc, sender zoekt.Sender, limit int) zoekt.Sender {
-	return stream.SenderFunc(func(result *zoekt.SearchResult) {
-		if len(result.Files) >= limit {
-			result.Files = result.Files[:limit]
+// limitSender wraps a sender and calls cancel once the truncator has finished
+// truncating.
+func limitSender(cancel context.CancelFunc, sender zoekt.Sender, truncator zoekt.DisplayTruncator) zoekt.Sender {
+	return zoekt.SenderFunc(func(result *zoekt.SearchResult) {
+		var hasMore bool
+		result.Files, hasMore = truncator(result.Files)
+		if !hasMore {
 			cancel()
 		}
-		limit -= len(result.Files)
 		sender.Send(result)
 	})
 }
 
 func copyFileSender(sender zoekt.Sender) zoekt.Sender {
-	return stream.SenderFunc(func(result *zoekt.SearchResult) {
+	return zoekt.SenderFunc(func(result *zoekt.SearchResult) {
 		copyFiles(result)
 		sender.Send(result)
 	})

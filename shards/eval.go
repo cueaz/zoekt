@@ -5,7 +5,6 @@ import (
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
-	"github.com/sourcegraph/zoekt/stream"
 	"github.com/sourcegraph/zoekt/trace"
 )
 
@@ -44,7 +43,7 @@ func (s *typeRepoSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	tr, ctx := trace.New(ctx, "typeRepoSearcher.StreamSearch", "")
 	tr.LazyLog(q, true)
 	tr.LazyPrintf("opts: %+v", opts)
-	var stats *zoekt.Stats
+	var stats zoekt.Stats
 	defer func() {
 		tr.LazyPrintf("stats: %+v", stats)
 		if err != nil {
@@ -59,15 +58,10 @@ func (s *typeRepoSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 		return err
 	}
 
-	if opts.Trace {
-		stats = &zoekt.Stats{}
-		return s.Streamer.StreamSearch(ctx, q, opts, stream.SenderFunc(func(event *zoekt.SearchResult) {
-			stats.Add(event.Stats)
-			sender.Send(event)
-		}))
-	}
-
-	return s.Streamer.StreamSearch(ctx, q, opts, sender)
+	return s.Streamer.StreamSearch(ctx, q, opts, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
+		stats.Add(event.Stats)
+		sender.Send(event)
+	}))
 }
 
 func (s *typeRepoSearcher) List(ctx context.Context, q query.Q, opts *zoekt.ListOptions) (rl *zoekt.RepoList, err error) {
@@ -77,8 +71,8 @@ func (s *typeRepoSearcher) List(ctx context.Context, q query.Q, opts *zoekt.List
 	defer func() {
 		if rl != nil {
 			tr.LazyPrintf("repos size: %d", len(rl.Repos))
+			tr.LazyPrintf("reposmap size: %d", len(rl.ReposMap))
 			tr.LazyPrintf("crashes: %d", rl.Crashes)
-			tr.LazyPrintf("minimal size : %d", len(rl.Minimal))
 			tr.LazyPrintf("stats: %+v", rl.Stats)
 		}
 		if err != nil {

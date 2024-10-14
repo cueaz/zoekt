@@ -45,7 +45,7 @@ func displayMatches(files []zoekt.FileMatch, pat string, withRepo bool, list boo
 			r = f.Repository + "/"
 		}
 		if list {
-			fmt.Printf("%s%s\n", r, f.FileName)
+			fmt.Printf("%s%s%s\n", r, f.FileName, addTabIfNonEmpty(f.Debug))
 			continue
 		}
 		if vimgrep {
@@ -93,9 +93,16 @@ func displayMatches(files []zoekt.FileMatch, pat string, withRepo bool, list boo
 		}
 
 		for _, m := range f.LineMatches {
-			fmt.Printf("%s%s:%d:%s\n", r, f.FileName, m.LineNumber, m.Line)
+			fmt.Printf("%s%s:%d:%s%s\n", r, f.FileName, m.LineNumber, m.Line, addTabIfNonEmpty(f.Debug))
 		}
 	}
+}
+
+func addTabIfNonEmpty(s string) string {
+	if s != "" {
+		return "\t" + s
+	}
+	return s
 }
 
 func loadShard(fn string, verbose bool) (zoekt.Searcher, error) {
@@ -173,6 +180,24 @@ func startFullProfile(path string, duration time.Duration) func() bool {
 	})
 }
 
+// experimental support for symbol queries. We just convert substring queries
+// into symbol queries. Needs to run after query.ExpandFileContent
+func toSymbolQuery(q query.Q) query.Q {
+	return query.Map(q, func(q query.Q) query.Q {
+		switch s := q.(type) {
+		case *query.Substring:
+			if s.Content {
+				return &query.Symbol{Expr: s}
+			}
+		case *query.Regexp:
+			if s.Content {
+				return &query.Symbol{Expr: s}
+			}
+		}
+		return q
+	})
+}
+
 func main() {
 	shard := flag.String("shard", "", "search in a specific shard")
 	index := flag.String("index_dir",
@@ -180,9 +205,11 @@ func main() {
 	cpuProfile := flag.String("cpu_profile", "", "write cpu profile to `file`")
 	fullProfile := flag.String("full_profile", "", "write full profile to `file`")
 	profileTime := flag.Duration("profile_time", time.Second, "run this long to gather stats.")
+	debug := flag.Bool("debug", false, "show debugscore output.")
 	verbose := flag.Bool("v", false, "print some background data")
 	withRepo := flag.Bool("r", false, "print the repo before the file name")
 	list := flag.Bool("l", false, "print matching filenames only")
+	sym := flag.Bool("sym", false, "do experimental symbol search")
 	color := flag.Bool("color", false, "colorize output")
 	vimgrep := flag.Bool("vimgrep", false, "print additional column numbers")
 
@@ -214,16 +241,23 @@ func main() {
 		log.Fatal(err)
 	}
 
-	query, err := query.Parse(pat)
+	q, err := query.Parse(pat)
 	if err != nil {
 		log.Fatal(err)
 	}
+	q = query.Map(q, query.ExpandFileContent)
+	if *sym {
+		q = toSymbolQuery(q)
+	}
+	q = query.Simplify(q)
 	if *verbose {
-		log.Println("query:", query)
+		log.Println("query:", q)
 	}
 
-	var sOpts zoekt.SearchOptions
-	sres, err := searcher.Search(context.Background(), query, &sOpts)
+	sOpts := zoekt.SearchOptions{
+		DebugScore: *debug,
+	}
+	sres, err := searcher.Search(context.Background(), q, &sOpts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -231,10 +265,10 @@ func main() {
 	// If profiling, do it another time so we measure with
 	// warm caches.
 	for run := startCPUProfile(*cpuProfile, *profileTime); run(); {
-		sres, _ = searcher.Search(context.Background(), query, &sOpts)
+		sres, _ = searcher.Search(context.Background(), q, &sOpts)
 	}
 	for run := startFullProfile(*fullProfile, *profileTime); run(); {
-		sres, _ = searcher.Search(context.Background(), query, &sOpts)
+		sres, _ = searcher.Search(context.Background(), q, &sOpts)
 	}
 
 	displayMatches(sres.Files, pat, *withRepo, *list, *color, *vimgrep)

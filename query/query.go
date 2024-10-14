@@ -15,8 +15,6 @@
 package query
 
 import (
-	"bytes"
-	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,10 +23,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/grafana/regexp"
+	"github.com/sourcegraph/zoekt/internal/syntaxutil"
 )
 
 var _ = log.Println
@@ -36,17 +34,6 @@ var _ = log.Println
 // Q is a representation for a possibly hierarchical search query.
 type Q interface {
 	String() string
-}
-
-// RPCUnwrap processes q to remove RPC specific elements from q. This is
-// needed because gob isn't flexible enough for us. This should be called by
-// RPC servers at the client/server boundary so that q works with the rest of
-// zoekt.
-func RPCUnwrap(q Q) Q {
-	if cache, ok := q.(*GobCache); ok {
-		return cache.Q
-	}
-	return q
 }
 
 // RawConfig filters repositories based on their encoded RawConfig map.
@@ -99,7 +86,7 @@ func (q *Regexp) String() string {
 	if q.CaseSensitive {
 		pref = "case_" + pref
 	}
-	return fmt.Sprintf("%sregex:%q", pref, q.Regexp.String())
+	return fmt.Sprintf("%sregex:%q", pref, syntaxutil.RegexpString(q.Regexp))
 }
 
 // gobRegexp wraps Regexp to make it gob-encodable/decodable. Regexp contains syntax.Regexp, which
@@ -112,7 +99,7 @@ type gobRegexp struct {
 
 // GobEncode implements gob.Encoder.
 func (q Regexp) GobEncode() ([]byte, error) {
-	gobq := gobRegexp{Regexp: q, RegexpString: q.Regexp.String()}
+	gobq := gobRegexp{Regexp: q, RegexpString: syntaxutil.RegexpString(q.Regexp)}
 	gobq.Regexp.Regexp = nil // can't be gob-encoded/decoded
 	return json.Marshal(gobq)
 }
@@ -386,6 +373,19 @@ func (q *Type) String() string {
 	}
 }
 
+// Boost scales the contribution to score of descendents.
+type Boost struct {
+	Child Q
+	// Boost will multiply the score of its descendents. Values less than 1 will
+	// give less importance while values greater than 1 will give more
+	// importance.
+	Boost float64
+}
+
+func (q *Boost) String() string {
+	return fmt.Sprintf("(boost %0.2f %s)", q.Boost, q.Child)
+}
+
 // Substring is the most basic query: a query for a substring.
 type Substring struct {
 	Pattern       string
@@ -444,58 +444,8 @@ func (q *Regexp) setCase(k string) {
 	case "no":
 		q.CaseSensitive = false
 	case "auto":
-		q.CaseSensitive = (q.Regexp.String() != LowerRegexp(q.Regexp).String())
+		q.CaseSensitive = !q.Regexp.Equal(LowerRegexp(q.Regexp))
 	}
-}
-
-// GobCache exists so we only pay the cost of marshalling a query once when we
-// aggregate it out over all the replicas.
-//
-// Our query and eval layer do not support GobCache. Instead, at the gob
-// boundaries (RPC and Streaming) we check if the Q is a GobCache and unwrap
-// it.
-//
-// "I wish we could get rid of this code soon enough" - tomas
-type GobCache struct {
-	Q
-
-	once sync.Once
-	data []byte
-	err  error
-}
-
-// GobEncode implements gob.Encoder.
-func (q *GobCache) GobEncode() ([]byte, error) {
-	q.once.Do(func() {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		q.err = enc.Encode(&gobWrapper{
-			WrappedQ: q.Q,
-		})
-		q.data = buf.Bytes()
-	})
-	return q.data, q.err
-}
-
-// GobDecode implements gob.Decoder.
-func (q *GobCache) GobDecode(data []byte) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
-	var w gobWrapper
-	err := dec.Decode(&w)
-	if err != nil {
-		return err
-	}
-	q.Q = w.WrappedQ
-	return nil
-}
-
-// gobWrapper is needed so the gob decoder works.
-type gobWrapper struct {
-	WrappedQ Q
-}
-
-func (q *GobCache) String() string {
-	return fmt.Sprintf("GobCache(%s)", q.Q)
 }
 
 // Or is matched when any of its children is matched.
@@ -609,6 +559,9 @@ func flatten(q Q) (Q, bool) {
 	case *Type:
 		child, changed := flatten(s.Child)
 		return &Type{Child: child, Type: s.Type}, changed
+	case *Boost:
+		child, changed := flatten(s.Child)
+		return &Boost{Child: child, Boost: s.Boost}, changed
 	default:
 		return q, false
 	}
@@ -680,6 +633,12 @@ func evalConstants(q Q) Q {
 			return ch
 		}
 		return &Type{Child: ch, Type: s.Type}
+	case *Boost:
+		ch := evalConstants(s.Child)
+		if _, ok := ch.(*Const); ok {
+			return ch
+		}
+		return &Boost{Boost: s.Boost, Child: ch}
 	case *Substring:
 		if len(s.Pattern) == 0 {
 			return &Const{true}
@@ -728,6 +687,8 @@ func Map(q Q, f func(q Q) Q) Q {
 		q = &Not{Child: Map(s.Child, f)}
 	case *Type:
 		q = &Type{Type: s.Type, Child: Map(s.Child, f)}
+	case *Boost:
+		q = &Boost{Boost: s.Boost, Child: Map(s.Child, f)}
 	}
 	return f(q)
 }
@@ -768,6 +729,7 @@ func VisitAtoms(q Q, v func(q Q)) {
 		case *Or:
 		case *Not:
 		case *Type:
+		case *Boost:
 		default:
 			v(iQ)
 		}

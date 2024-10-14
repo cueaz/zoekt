@@ -27,9 +27,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	webproto "github.com/sourcegraph/zoekt/grpc/protos/zoekt/webserver/v1"
 	"google.golang.org/protobuf/proto"
 
-	v1 "github.com/sourcegraph/zoekt/grpc/v1"
+	fuzz "github.com/AdaLogics/go-fuzz-headers"
 )
 
 func TestProtoRoundtrip(t *testing.T) {
@@ -133,14 +134,45 @@ func TestProtoRoundtrip(t *testing.T) {
 	})
 
 	t.Run("SearchResult", func(t *testing.T) {
-		f := func(f1 *SearchResult) bool {
-			p1 := f1.ToProto()
-			f2 := SearchResultFromProto(p1)
-			return reflect.DeepEqual(f1, f2)
-		}
-		if err := quick.Check(f, nil); err != nil {
-			t.Fatal(err)
-		}
+		t.Run("unary", func(t *testing.T) {
+			f := func(f1 *SearchResult) bool {
+				var repoURLs map[string]string
+				var lineFragments map[string]string
+
+				if f1 != nil {
+					repoURLs = f1.RepoURLs
+					lineFragments = f1.LineFragments
+				}
+
+				p1 := f1.ToProto()
+				f2 := SearchResultFromProto(p1, repoURLs, lineFragments)
+
+				return reflect.DeepEqual(f1, f2)
+			}
+			if err := quick.Check(f, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		t.Run("stream", func(t *testing.T) {
+			f := func(f1 *SearchResult) bool {
+				var repoURLs map[string]string
+				var lineFragments map[string]string
+
+				if f1 != nil {
+					repoURLs = f1.RepoURLs
+					lineFragments = f1.LineFragments
+				}
+
+				p1 := f1.ToStreamProto()
+				f2 := SearchResultFromStreamProto(p1, repoURLs, lineFragments)
+
+				return reflect.DeepEqual(f1, f2)
+			}
+			if err := quick.Check(f, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
 	})
 
 	t.Run("Repository", func(t *testing.T) {
@@ -303,9 +335,6 @@ func TestProtoRoundtrip(t *testing.T) {
 	t.Run("SearchOptions", func(t *testing.T) {
 		f := func(f1 *SearchOptions) bool {
 			if f1 != nil {
-				// Ignore deprecated and unimplemented fields
-				f1.ShardMaxImportantMatch = 0
-				f1.TotalMaxImportantMatch = 0
 				f1.SpanContext = nil
 			}
 			p1 := f1.ToProto()
@@ -362,12 +391,9 @@ func (*Repository) Generate(rng *rand.Rand, _ int) reflect.Value {
 }
 
 func (RepoListField) Generate(rng *rand.Rand, _ int) reflect.Value {
-	switch rng.Int() % 3 {
-	case 0:
+	if rng.Intn(2) == 0 {
 		return reflect.ValueOf(RepoListField(RepoListFieldRepos))
-	case 1:
-		return reflect.ValueOf(RepoListField(RepoListFieldMinimal))
-	default:
+	} else {
 		return reflect.ValueOf(RepoListField(RepoListFieldReposMap))
 	}
 }
@@ -387,8 +413,8 @@ var (
 	exampleSearchResultBytes []byte
 
 	// The proto struct representation of the search result
-	exampleSearchResultProto = func() *v1.SearchResponse {
-		sr := new(v1.SearchResponse)
+	exampleSearchResultProto = func() *webproto.SearchResponse {
+		sr := new(webproto.SearchResponse)
 		err := proto.Unmarshal(exampleSearchResultBytes, sr)
 		if err != nil {
 			panic(err)
@@ -397,7 +423,7 @@ var (
 	}()
 
 	// The non-proto struct representation of the search result
-	exampleSearchResultGo = SearchResultFromProto(exampleSearchResultProto)
+	exampleSearchResultGo = SearchResultFromProto(exampleSearchResultProto, nil, nil)
 )
 
 func BenchmarkGobRoundtrip(b *testing.B) {
@@ -442,7 +468,7 @@ func BenchmarkProtoRoundtrip(b *testing.B) {
 				}
 
 				for _, buf := range buffers {
-					res := new(v1.SearchResponse)
+					res := new(webproto.SearchResponse)
 					err := proto.Unmarshal(buf, res)
 					if err != nil {
 						b.Fatal(err)
@@ -451,4 +477,29 @@ func BenchmarkProtoRoundtrip(b *testing.B) {
 			}
 		})
 	}
+}
+
+func Fuzz_RepoList_ProtoRoundTrip(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		fc := fuzz.NewConsumer(data)
+		fc.AllowUnexportedFields()
+
+		original := &RepoList{}
+		err := fc.GenerateStruct(original)
+		if err != nil {
+			return
+		}
+
+		p := original.ToProto()
+		converted := RepoListFromProto(p)
+
+		opts := []cmp.Option{
+			cmpopts.IgnoreUnexported(Repository{}),
+			cmpopts.EquateEmpty(),
+		}
+
+		if diff := cmp.Diff(original, converted, opts...); diff != "" {
+			t.Fatalf("unexpected diff (-want +got)\n%s", diff)
+		}
+	})
 }

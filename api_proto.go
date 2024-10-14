@@ -18,7 +18,7 @@ import (
 	"math/rand"
 	"reflect"
 
-	proto "github.com/sourcegraph/zoekt/grpc/v1"
+	proto "github.com/sourcegraph/zoekt/grpc/protos/zoekt/webserver/v1"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -37,7 +37,7 @@ func FileMatchFromProto(p *proto.FileMatch) FileMatch {
 	return FileMatch{
 		Score:              p.GetScore(),
 		Debug:              p.GetDebug(),
-		FileName:           p.GetFileName(),
+		FileName:           string(p.GetFileName()), // Note: 🚨Warning, this filename may be a non-UTF8 string.
 		Repository:         p.GetRepository(),
 		Branches:           p.GetBranches(),
 		LineMatches:        lineMatches,
@@ -67,7 +67,7 @@ func (m *FileMatch) ToProto() *proto.FileMatch {
 	return &proto.FileMatch{
 		Score:              m.Score,
 		Debug:              m.Debug,
-		FileName:           m.FileName,
+		FileName:           []byte(m.FileName),
 		Repository:         m.Repository,
 		Branches:           m.Branches,
 		LineMatches:        lineMatches,
@@ -243,11 +243,11 @@ func (lfm *LineFragmentMatch) ToProto() *proto.LineFragmentMatch {
 
 func FlushReasonFromProto(p proto.FlushReason) FlushReason {
 	switch p {
-	case proto.FlushReason_TIMER_EXPIRED:
+	case proto.FlushReason_FLUSH_REASON_TIMER_EXPIRED:
 		return FlushReasonTimerExpired
-	case proto.FlushReason_FINAL_FLUSH:
+	case proto.FlushReason_FLUSH_REASON_FINAL_FLUSH:
 		return FlushReasonFinalFlush
-	case proto.FlushReason_MAX_SIZE:
+	case proto.FlushReason_FLUSH_REASON_MAX_SIZE:
 		return FlushReasonMaxSize
 	default:
 		return FlushReason(0)
@@ -257,13 +257,13 @@ func FlushReasonFromProto(p proto.FlushReason) FlushReason {
 func (fr FlushReason) ToProto() proto.FlushReason {
 	switch fr {
 	case FlushReasonTimerExpired:
-		return proto.FlushReason_TIMER_EXPIRED
+		return proto.FlushReason_FLUSH_REASON_TIMER_EXPIRED
 	case FlushReasonFinalFlush:
-		return proto.FlushReason_FINAL_FLUSH
+		return proto.FlushReason_FLUSH_REASON_FINAL_FLUSH
 	case FlushReasonMaxSize:
-		return proto.FlushReason_MAX_SIZE
+		return proto.FlushReason_FLUSH_REASON_MAX_SIZE
 	default:
-		return proto.FlushReason_UNKNOWN
+		return proto.FlushReason_FLUSH_REASON_UNKNOWN_UNSPECIFIED
 	}
 }
 
@@ -283,47 +283,51 @@ func (fr FlushReason) Generate(rand *rand.Rand, size int) reflect.Value {
 
 func StatsFromProto(p *proto.Stats) Stats {
 	return Stats{
-		ContentBytesLoaded:   p.GetContentBytesLoaded(),
-		IndexBytesLoaded:     p.GetIndexBytesLoaded(),
-		Crashes:              int(p.GetCrashes()),
-		Duration:             p.GetDuration().AsDuration(),
-		FileCount:            int(p.GetFileCount()),
-		ShardFilesConsidered: int(p.GetShardFilesConsidered()),
-		FilesConsidered:      int(p.GetFilesConsidered()),
-		FilesLoaded:          int(p.GetFilesLoaded()),
-		FilesSkipped:         int(p.GetFilesSkipped()),
-		ShardsScanned:        int(p.GetShardsScanned()),
-		ShardsSkipped:        int(p.GetShardsSkipped()),
-		ShardsSkippedFilter:  int(p.GetShardsSkippedFilter()),
-		MatchCount:           int(p.GetMatchCount()),
-		NgramMatches:         int(p.GetNgramMatches()),
-		NgramLookups:         int(p.GetNgramLookups()),
-		Wait:                 p.GetWait().AsDuration(),
-		RegexpsConsidered:    int(p.GetRegexpsConsidered()),
-		FlushReason:          FlushReasonFromProto(p.GetFlushReason()),
+		ContentBytesLoaded:    p.GetContentBytesLoaded(),
+		IndexBytesLoaded:      p.GetIndexBytesLoaded(),
+		Crashes:               int(p.GetCrashes()),
+		Duration:              p.GetDuration().AsDuration(),
+		FileCount:             int(p.GetFileCount()),
+		ShardFilesConsidered:  int(p.GetShardFilesConsidered()),
+		FilesConsidered:       int(p.GetFilesConsidered()),
+		FilesLoaded:           int(p.GetFilesLoaded()),
+		FilesSkipped:          int(p.GetFilesSkipped()),
+		ShardsScanned:         int(p.GetShardsScanned()),
+		ShardsSkipped:         int(p.GetShardsSkipped()),
+		ShardsSkippedFilter:   int(p.GetShardsSkippedFilter()),
+		MatchCount:            int(p.GetMatchCount()),
+		NgramMatches:          int(p.GetNgramMatches()),
+		NgramLookups:          int(p.GetNgramLookups()),
+		Wait:                  p.GetWait().AsDuration(),
+		MatchTreeConstruction: p.GetMatchTreeConstruction().AsDuration(),
+		MatchTreeSearch:       p.GetMatchTreeSearch().AsDuration(),
+		RegexpsConsidered:     int(p.GetRegexpsConsidered()),
+		FlushReason:           FlushReasonFromProto(p.GetFlushReason()),
 	}
 }
 
 func (s *Stats) ToProto() *proto.Stats {
 	return &proto.Stats{
-		ContentBytesLoaded:   s.ContentBytesLoaded,
-		IndexBytesLoaded:     s.IndexBytesLoaded,
-		Crashes:              int64(s.Crashes),
-		Duration:             durationpb.New(s.Duration),
-		FileCount:            int64(s.FileCount),
-		ShardFilesConsidered: int64(s.ShardFilesConsidered),
-		FilesConsidered:      int64(s.FilesConsidered),
-		FilesLoaded:          int64(s.FilesLoaded),
-		FilesSkipped:         int64(s.FilesSkipped),
-		ShardsScanned:        int64(s.ShardsScanned),
-		ShardsSkipped:        int64(s.ShardsSkipped),
-		ShardsSkippedFilter:  int64(s.ShardsSkippedFilter),
-		MatchCount:           int64(s.MatchCount),
-		NgramMatches:         int64(s.NgramMatches),
-		NgramLookups:         int64(s.NgramLookups),
-		Wait:                 durationpb.New(s.Wait),
-		RegexpsConsidered:    int64(s.RegexpsConsidered),
-		FlushReason:          s.FlushReason.ToProto(),
+		ContentBytesLoaded:    s.ContentBytesLoaded,
+		IndexBytesLoaded:      s.IndexBytesLoaded,
+		Crashes:               int64(s.Crashes),
+		Duration:              durationpb.New(s.Duration),
+		FileCount:             int64(s.FileCount),
+		ShardFilesConsidered:  int64(s.ShardFilesConsidered),
+		FilesConsidered:       int64(s.FilesConsidered),
+		FilesLoaded:           int64(s.FilesLoaded),
+		FilesSkipped:          int64(s.FilesSkipped),
+		ShardsScanned:         int64(s.ShardsScanned),
+		ShardsSkipped:         int64(s.ShardsSkipped),
+		ShardsSkippedFilter:   int64(s.ShardsSkippedFilter),
+		MatchCount:            int64(s.MatchCount),
+		NgramMatches:          int64(s.NgramMatches),
+		NgramLookups:          int64(s.NgramLookups),
+		Wait:                  durationpb.New(s.Wait),
+		MatchTreeConstruction: durationpb.New(s.MatchTreeConstruction),
+		MatchTreeSearch:       durationpb.New(s.MatchTreeSearch),
+		RegexpsConsidered:     int64(s.RegexpsConsidered),
+		FlushReason:           s.FlushReason.ToProto(),
 	}
 }
 
@@ -341,7 +345,15 @@ func (p *Progress) ToProto() *proto.Progress {
 	}
 }
 
-func SearchResultFromProto(p *proto.SearchResponse) *SearchResult {
+func SearchResultFromStreamProto(p *proto.StreamSearchResponse, repoURLs, lineFragments map[string]string) *SearchResult {
+	if p == nil {
+		return nil
+	}
+
+	return SearchResultFromProto(p.GetResponseChunk(), repoURLs, lineFragments)
+}
+
+func SearchResultFromProto(p *proto.SearchResponse, repoURLs, lineFragments map[string]string) *SearchResult {
 	if p == nil {
 		return nil
 	}
@@ -352,11 +364,13 @@ func SearchResultFromProto(p *proto.SearchResponse) *SearchResult {
 	}
 
 	return &SearchResult{
-		Stats:         StatsFromProto(p.GetStats()),
-		Progress:      ProgressFromProto(p.GetProgress()),
-		Files:         files,
-		RepoURLs:      p.RepoUrls,
-		LineFragments: p.LineFragments,
+		Stats:    StatsFromProto(p.GetStats()),
+		Progress: ProgressFromProto(p.GetProgress()),
+
+		Files: files,
+
+		RepoURLs:      repoURLs,
+		LineFragments: lineFragments,
 	}
 }
 
@@ -371,12 +385,19 @@ func (sr *SearchResult) ToProto() *proto.SearchResponse {
 	}
 
 	return &proto.SearchResponse{
-		Stats:         sr.Stats.ToProto(),
-		Progress:      sr.Progress.ToProto(),
-		Files:         files,
-		RepoUrls:      sr.RepoURLs,
-		LineFragments: sr.LineFragments,
+		Stats:    sr.Stats.ToProto(),
+		Progress: sr.Progress.ToProto(),
+
+		Files: files,
 	}
+}
+
+func (sr *SearchResult) ToStreamProto() *proto.StreamSearchResponse {
+	if sr == nil {
+		return nil
+	}
+
+	return &proto.StreamSearchResponse{ResponseChunk: sr.ToProto()}
 }
 
 func RepositoryBranchFromProto(p *proto.RepositoryBranch) RepositoryBranch {
@@ -384,7 +405,6 @@ func RepositoryBranchFromProto(p *proto.RepositoryBranch) RepositoryBranch {
 		Name:    p.GetName(),
 		Version: p.GetVersion(),
 	}
-
 }
 
 func (r *RepositoryBranch) ToProto() *proto.RepositoryBranch {
@@ -599,18 +619,11 @@ func RepoListFromProto(p *proto.ListResponse) *RepoList {
 		reposMap[id] = MinimalRepoListEntryFromProto(mle)
 	}
 
-	minimal := make(map[uint32]*MinimalRepoListEntry, len(p.GetMinimal()))
-	for id, mle := range p.GetMinimal() {
-		m := MinimalRepoListEntryFromProto(mle)
-		minimal[id] = &m
-	}
-
 	return &RepoList{
 		Repos:    repos,
 		ReposMap: reposMap,
 		Crashes:  int(p.GetCrashes()),
 		Stats:    RepoStatsFromProto(p.GetStats()),
-		Minimal:  minimal,
 	}
 }
 
@@ -625,17 +638,11 @@ func (r *RepoList) ToProto() *proto.ListResponse {
 		reposMap[id] = repo.ToProto()
 	}
 
-	minimal := make(map[uint32]*proto.MinimalRepoListEntry, len(r.Minimal))
-	for id, repo := range r.Minimal {
-		minimal[id] = repo.ToProto()
-	}
-
 	return &proto.ListResponse{
-		Repos:    []*proto.RepoListEntry{},
+		Repos:    repos,
 		ReposMap: reposMap,
 		Crashes:  int64(r.Crashes),
 		Stats:    r.Stats.ToProto(),
-		Minimal:  minimal,
 	}
 }
 
@@ -647,15 +654,12 @@ func (l *ListOptions) ToProto() *proto.ListOptions {
 	switch l.Field {
 	case RepoListFieldRepos:
 		field = proto.ListOptions_REPO_LIST_FIELD_REPOS
-	case RepoListFieldMinimal:
-		field = proto.ListOptions_REPO_LIST_FIELD_MINIMAL
 	case RepoListFieldReposMap:
 		field = proto.ListOptions_REPO_LIST_FIELD_REPOS_MAP
 	}
 
 	return &proto.ListOptions{
-		Field:   field,
-		Minimal: l.Minimal,
+		Field: field,
 	}
 }
 
@@ -667,14 +671,11 @@ func ListOptionsFromProto(p *proto.ListOptions) *ListOptions {
 	switch p.GetField() {
 	case proto.ListOptions_REPO_LIST_FIELD_REPOS:
 		field = RepoListFieldRepos
-	case proto.ListOptions_REPO_LIST_FIELD_MINIMAL:
-		field = RepoListFieldMinimal
 	case proto.ListOptions_REPO_LIST_FIELD_REPOS_MAP:
 		field = RepoListFieldReposMap
 	}
 	return &ListOptions{
-		Field:   field,
-		Minimal: p.GetMinimal(),
+		Field: field,
 	}
 }
 
@@ -692,13 +693,14 @@ func SearchOptionsFromProto(p *proto.SearchOptions) *SearchOptions {
 		MaxWallTime:            p.GetMaxWallTime().AsDuration(),
 		FlushWallTime:          p.GetFlushWallTime().AsDuration(),
 		MaxDocDisplayCount:     int(p.GetMaxDocDisplayCount()),
+		MaxMatchDisplayCount:   int(p.GetMaxMatchDisplayCount()),
 		NumContextLines:        int(p.GetNumContextLines()),
 		ChunkMatches:           p.GetChunkMatches(),
 		UseDocumentRanks:       p.GetUseDocumentRanks(),
 		DocumentRanksWeight:    p.GetDocumentRanksWeight(),
 		Trace:                  p.GetTrace(),
 		DebugScore:             p.GetDebugScore(),
-		UseKeywordScoring:      p.GetUseKeywordScoring(),
+		UseBM25Scoring:         p.GetUseBm25Scoring(),
 	}
 }
 
@@ -716,12 +718,13 @@ func (s *SearchOptions) ToProto() *proto.SearchOptions {
 		MaxWallTime:            durationpb.New(s.MaxWallTime),
 		FlushWallTime:          durationpb.New(s.FlushWallTime),
 		MaxDocDisplayCount:     int64(s.MaxDocDisplayCount),
+		MaxMatchDisplayCount:   int64(s.MaxMatchDisplayCount),
 		NumContextLines:        int64(s.NumContextLines),
 		ChunkMatches:           s.ChunkMatches,
 		UseDocumentRanks:       s.UseDocumentRanks,
 		DocumentRanksWeight:    s.DocumentRanksWeight,
 		Trace:                  s.Trace,
 		DebugScore:             s.DebugScore,
-		UseKeywordScoring:      s.UseKeywordScoring,
+		UseBm25Scoring:         s.UseBM25Scoring,
 	}
 }

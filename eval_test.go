@@ -24,6 +24,7 @@ import (
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/grafana/regexp"
 
 	"github.com/sourcegraph/zoekt/query"
@@ -58,24 +59,35 @@ func printRegexp(t *testing.T, r *syntax.Regexp, lvl int) {
 	}
 }
 
+func caseSensitiveSubstrMT(pattern string) matchTree {
+	d := &indexData{}
+	mt, _ := d.newSubstringMatchTree(&query.Substring{
+		Pattern:       pattern,
+		CaseSensitive: true,
+	})
+	return mt
+}
+
 func substrMT(pattern string) matchTree {
 	d := &indexData{}
 	mt, _ := d.newSubstringMatchTree(&query.Substring{
-		Pattern: pattern,
+		Pattern:       pattern,
+		CaseSensitive: false,
 	})
 	return mt
 }
 
 func TestRegexpParse(t *testing.T) {
 	type testcase struct {
-		in           string
-		query        matchTree
-		isEquivalent bool
+		in            string
+		query         matchTree
+		isEquivalent  bool
+		caseSensitive bool
 	}
 
 	cases := []testcase{
-		{"(foo|)bar", substrMT("bar"), false},
-		{"(foo|)", &bruteForceMatchTree{}, false},
+		{"(foo|)bar", substrMT("bar"), false, false},
+		{"(foo|)", &bruteForceMatchTree{}, false, false},
 		{"(foo|bar)baz.*bla", &andMatchTree{[]matchTree{
 			&orMatchTree{[]matchTree{
 				substrMT("foo"),
@@ -83,32 +95,35 @@ func TestRegexpParse(t *testing.T) {
 			}},
 			substrMT("baz"),
 			substrMT("bla"),
-		}}, false},
+		}}, false, false},
 		{
 			"^[a-z](People)+barrabas$",
 			&andMatchTree{[]matchTree{
 				substrMT("People"),
 				substrMT("barrabas"),
-			}}, false,
+			}}, false, false,
 		},
-		{"foo", substrMT("foo"), true},
-		{"^foo", substrMT("foo"), false},
-		{"(foo) (bar)", &andMatchTree{[]matchTree{substrMT("foo"), substrMT("bar")}}, false},
+		{"foo", substrMT("foo"), true, false},
+		{"foo", caseSensitiveSubstrMT("foo"), true, true},
+		{"(?i)foo", substrMT("FOO"), true, false},
+		{"(?i)foo", substrMT("FOO"), true, true},
+		{"^foo", substrMT("foo"), false, false},
+		{"(foo) (bar)", &andMatchTree{[]matchTree{substrMT("foo"), substrMT("bar")}}, false, false},
 		{"(thread|needle|haystack)", &orMatchTree{[]matchTree{
 			substrMT("thread"),
 			substrMT("needle"),
 			substrMT("haystack"),
-		}}, true},
+		}}, true, false},
 		{"(foo)(?-s:.)*?(bar)", &andLineMatchTree{andMatchTree{[]matchTree{
 			substrMT("foo"),
 			substrMT("bar"),
-		}}}, false},
+		}}}, false, false},
 		{"(foo)(?-s:.)*?[[:space:]](?-s:.)*?(bar)", &andMatchTree{[]matchTree{
 			substrMT("foo"),
 			substrMT("bar"),
-		}}, false},
-		{"(foo){2,}", substrMT("foo"), false},
-		{"(...)(...)", &bruteForceMatchTree{}, false},
+		}}, false, false},
+		{"(foo){2,}", substrMT("foo"), false, false},
+		{"(...)(...)", &bruteForceMatchTree{}, false, false},
 	}
 
 	for _, c := range cases {
@@ -119,7 +134,8 @@ func TestRegexpParse(t *testing.T) {
 		}
 		d := indexData{}
 		q := query.Regexp{
-			Regexp: r,
+			Regexp:        r,
+			CaseSensitive: c.caseSensitive,
 		}
 		gotQuery, isEq, _, _ := d.regexpToMatchTreeRecursive(q.Regexp, 3, q.FileName, q.CaseSensitive)
 		if !reflect.DeepEqual(c.query, gotQuery) {
@@ -159,14 +175,14 @@ func TestSearch_ShardRepoMaxMatchCountOpt(t *testing.T) {
 
 	t.Run("stats", func(t *testing.T) {
 		got, want := sr.Stats, Stats{
-			ContentBytesLoaded: 2,
+			ContentBytesLoaded: 0,
 			FileCount:          2,
 			FilesConsidered:    2,
 			FilesSkipped:       2,
 			ShardsScanned:      1,
 			MatchCount:         2,
 		}
-		if diff := cmp.Diff(want, got); diff != "" {
+		if diff := cmp.Diff(want, got, cmpopts.IgnoreFields(Stats{}, "MatchTreeConstruction", "MatchTreeSearch")); diff != "" {
 			t.Errorf("mismatch (-want, +got): %s", diff)
 		}
 	})
@@ -313,6 +329,22 @@ func TestSimplifyRepoRegexp(t *testing.T) {
 	}
 }
 
+func TestSimplifyRcRawConfig(t *testing.T) {
+	d := compoundReposShard(t, "foo", "bar")
+	var all = query.RcOnlyPrivate | query.RcNoForks | query.RcNoArchived
+
+	got := d.simplify(all)
+	if d := cmp.Diff(&query.Const{Value: true}, got); d != "" {
+		t.Fatalf("-want, +got:\n%s", d)
+	}
+
+	var none = query.RcOnlyPublic | query.RcNoForks | query.RcNoArchived
+	got = d.simplify(none)
+	if d := cmp.Diff(&query.Const{Value: false}, got); d != "" {
+		t.Fatalf("-want, +got:\n%s", d)
+	}
+}
+
 func TestSimplifyBranchesRepos(t *testing.T) {
 	d := compoundReposShard(t, "foo", "bar")
 
@@ -350,7 +382,8 @@ func TestGatherBranches(t *testing.T) {
 			{"main", "v1"},
 			{"bar", "v1"},
 			{"quz", "v1"},
-		}},
+		},
+	},
 		Document{Name: "f1", Content: content, Branches: []string{"foo", "bar", "quz"}},
 		Document{Name: "f2", Content: content, Branches: []string{"foo", "foo-2"}},
 		Document{Name: "f3", Content: content, Branches: []string{"main"}})
@@ -370,8 +403,8 @@ func TestGatherBranches(t *testing.T) {
 	}
 
 	want := map[string][]string{
-		"f1": []string{"foo", "quz"},
-		"f2": []string{"foo", "foo-2"},
+		"f1": {"foo", "quz"},
+		"f2": {"foo", "foo-2"},
 	}
 
 	if len(sr.Files) != 2 {

@@ -19,15 +19,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc64"
-	"html/template"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"text/template"
 	"time"
 	"unicode/utf8"
 
-	"github.com/go-enry/go-enry/v2"
+	"github.com/sourcegraph/zoekt/internal/languages"
 )
 
 var _ = log.Println
@@ -216,11 +218,41 @@ type IndexBuilder struct {
 
 func (d *Repository) verify() error {
 	for _, t := range []string{d.FileURLTemplate, d.LineFragmentTemplate, d.CommitURLTemplate} {
-		if _, err := template.New("").Parse(t); err != nil {
+		if _, err := ParseTemplate(t); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func urlJoinPath(base string, elem ...string) string {
+	// golangs html/template always escapes "+" appearing in an HTML attribute
+	// [1]. We may even want to treat more characters, differently but this
+	// atleast makes it possible to visit URLs like [2].
+	//
+	// We only do this to elem since base will normally be a hardcoded string.
+	//
+	// [1]: https://sourcegraph.com/github.com/golang/go@go1.23.2/-/blob/src/html/template/html.go?L71-80
+	// [2]: https://github.com/apple/swift-system/blob/main/Sources/System/Util+StringArray.swift
+	elem = append([]string{}, elem...) // copy to mutate
+	for i := range elem {
+		elem[i] = strings.ReplaceAll(elem[i], "+", "%2B")
+	}
+	u, err := url.JoinPath(base, elem...)
+	if err != nil {
+		return "#!error: " + err.Error()
+	}
+	return u
+}
+
+// ParseTemplate will parse the templates for FileURLTemplate,
+// LineFragmentTemplate and CommitURLTemplate.
+//
+// It makes available the extra function UrlJoinPath.
+func ParseTemplate(text string) (*template.Template, error) {
+	return template.New("").Funcs(template.FuncMap{
+		"URLJoinPath": urlJoinPath,
+	}).Parse(text)
 }
 
 // ContentSize returns the number of content bytes so far ingested.
@@ -228,6 +260,11 @@ func (b *IndexBuilder) ContentSize() uint32 {
 	// Add the name too so we don't skip building index if we have
 	// lots of empty files.
 	return b.contentPostings.endByte + b.namePostings.endByte
+}
+
+// NumFiles returns the number of files added to this builder
+func (b *IndexBuilder) NumFiles() int {
+	return len(b.contentStrings)
 }
 
 // NewIndexBuilder creates a fresh IndexBuilder. The passed in
@@ -333,51 +370,6 @@ func (b *IndexBuilder) AddFile(name string, content []byte) error {
 	return b.Add(Document{Name: name, Content: content})
 }
 
-// CheckText returns a reason why the given contents are probably not source texts.
-func CheckText(content []byte, maxTrigramCount int) error {
-	if len(content) == 0 {
-		return nil
-	}
-
-	if len(content) < ngramSize {
-		return fmt.Errorf("file size smaller than %d", ngramSize)
-	}
-
-	// PERF: we only need to do the trigram check if the upperbound on content
-	// is greater than our threshold.
-	var trigrams map[ngram]struct{}
-	if trigramsUpperBound := len(content) - ngramSize + 1; trigramsUpperBound > maxTrigramCount {
-		trigrams = make(map[ngram]struct{}, maxTrigramCount+1)
-	}
-
-	var cur [3]rune
-	byteCount := 0
-	for len(content) > 0 {
-		if content[0] == 0 {
-			return fmt.Errorf("binary data at byte offset %d", byteCount)
-		}
-
-		r, sz := utf8.DecodeRune(content)
-		content = content[sz:]
-		byteCount += sz
-
-		cur[0], cur[1], cur[2] = cur[1], cur[2], r
-		if cur[0] == 0 {
-			// start of file.
-			continue
-		}
-
-		if trigrams != nil {
-			trigrams[runesToNGram(cur)] = struct{}{}
-			if len(trigrams) > maxTrigramCount {
-				// probably not text.
-				return fmt.Errorf("number of trigrams exceeds %d", maxTrigramCount)
-			}
-		}
-	}
-	return nil
-}
-
 func (b *IndexBuilder) populateSubRepoIndices() error {
 	if len(b.subRepoIndices) == len(b.repoList) {
 		return nil
@@ -437,12 +429,7 @@ func (b *IndexBuilder) addSymbols(symbols []*Symbol) {
 
 func DetermineLanguageIfUnknown(doc *Document) {
 	if doc.Language == "" {
-		c := doc.Content
-		// classifier is faster on small files without losing much accuracy
-		if len(c) > 2048 {
-			c = c[:2048]
-		}
-		doc.Language = enry.GetLanguage(doc.Name, c)
+		doc.Language = languages.GetLanguage(doc.Name, doc.Content)
 	}
 }
 
@@ -553,4 +540,62 @@ func (b *IndexBuilder) branchMask(br string) uint64 {
 		}
 	}
 	return 0
+}
+
+type DocChecker struct {
+	// A map to count the unique trigrams in a doc. Reused across docs to cut down on allocations.
+	trigrams map[ngram]struct{}
+}
+
+// Check returns a reason why the given contents are probably not source texts.
+func (t *DocChecker) Check(content []byte, maxTrigramCount int, allowLargeFile bool) error {
+	if len(content) == 0 {
+		return nil
+	}
+
+	if len(content) < ngramSize {
+		return fmt.Errorf("file size smaller than %d", ngramSize)
+	}
+
+	if index := bytes.IndexByte(content, 0); index > 0 {
+		return fmt.Errorf("binary data at byte offset %d", index)
+	}
+
+	// PERF: we only need to do the trigram check if the upperbound on content is greater than
+	// our threshold. Also skip the trigram check if the file is explicitly marked as allowed.
+	if trigramsUpperBound := len(content) - ngramSize + 1; trigramsUpperBound <= maxTrigramCount || allowLargeFile {
+		return nil
+	}
+
+	var cur [3]rune
+	byteCount := 0
+	t.clearTrigrams(maxTrigramCount)
+
+	for len(content) > 0 {
+		r, sz := utf8.DecodeRune(content)
+		content = content[sz:]
+		byteCount += sz
+
+		cur[0], cur[1], cur[2] = cur[1], cur[2], r
+		if cur[0] == 0 {
+			// start of file.
+			continue
+		}
+
+		t.trigrams[runesToNGram(cur)] = struct{}{}
+		if len(t.trigrams) > maxTrigramCount {
+			// probably not text.
+			return fmt.Errorf("number of trigrams exceeds %d", maxTrigramCount)
+		}
+	}
+	return nil
+}
+
+func (t *DocChecker) clearTrigrams(maxTrigramCount int) {
+	if t.trigrams == nil {
+		t.trigrams = make(map[ngram]struct{}, maxTrigramCount)
+	}
+	for key := range t.trigrams {
+		delete(t.trigrams, key)
+	}
 }
