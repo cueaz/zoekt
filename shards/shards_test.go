@@ -17,8 +17,10 @@ package shards
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -38,6 +40,14 @@ import (
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
 )
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if !testing.Verbose() {
+		log.SetOutput(io.Discard)
+	}
+	os.Exit(m.Run())
+}
 
 type crashSearcher struct{}
 
@@ -59,8 +69,10 @@ func (s *crashSearcher) String() string { return "crashSearcher" }
 
 func TestCrashResilience(t *testing.T) {
 	out := &bytes.Buffer{}
+	oldOut := log.Writer()
 	log.SetOutput(out)
-	defer log.SetOutput(os.Stderr)
+	defer log.SetOutput(oldOut)
+
 	ss := newShardedSearcher(2)
 	ss.ranked.Store([]*rankedShard{{Searcher: &crashSearcher{}}})
 
@@ -252,8 +264,7 @@ func TestShardedSearcher_DocumentRanking(t *testing.T) {
 	// Run a stream search and gather the results
 	var results []*zoekt.SearchResult
 	opts := &zoekt.SearchOptions{
-		UseDocumentRanks: true,
-		FlushWallTime:    100 * time.Millisecond,
+		FlushWallTime: 100 * time.Millisecond,
 	}
 
 	err := ss.StreamSearch(context.Background(), &query.Substring{Pattern: "foo"}, opts,
@@ -1134,7 +1145,6 @@ func testShardedStreamSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder, us
 
 	opts := zoekt.SearchOptions{}
 	if useDocumentRanks {
-		opts.UseDocumentRanks = true
 		opts.FlushWallTime = 10 * time.Millisecond
 	}
 	if err := ss.StreamSearch(context.Background(), q, &opts, sender); err != nil {
@@ -1150,7 +1160,6 @@ func testShardedSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder, useDocum
 
 	opts := zoekt.SearchOptions{}
 	if useDocumentRanks {
-		opts.UseDocumentRanks = true
 		opts.FlushWallTime = 50 * time.Millisecond
 	}
 	sres, _ := ss.Search(context.Background(), q, &opts)

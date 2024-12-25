@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -18,11 +16,12 @@ import (
 	"strings"
 	"time"
 
+	sglog "github.com/sourcegraph/log"
+
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/ctags"
-
-	sglog "github.com/sourcegraph/log"
+	"github.com/sourcegraph/zoekt/internal/tenant"
 )
 
 const defaultIndexingTimeout = 1*time.Hour + 30*time.Minute
@@ -53,11 +52,6 @@ type IndexOptions struct {
 	// Priority indicates ranking in results, higher first.
 	Priority float64
 
-	// DocumentRanksVersion when non-empty will lead to indexing using offline
-	// ranking. When the string changes this will also cause us to re-index with
-	// new ranks.
-	DocumentRanksVersion string
-
 	// Public is true if the repository is public.
 	Public bool
 
@@ -73,6 +67,9 @@ type IndexOptions struct {
 	// The number of threads to use for indexing shards. Defaults to the number of available
 	// CPUs. If the server flag -cpu_fraction is set, then this value overrides it.
 	ShardConcurrency int32
+
+	// TenantID is the tenant ID for the repository.
+	TenantID int
 }
 
 // indexArgs represents the arguments we pass to zoekt-git-index
@@ -106,12 +103,18 @@ type indexArgs struct {
 // BuildOptions returns a build.Options represented by indexArgs. Note: it
 // doesn't set fields like repository/branch.
 func (o *indexArgs) BuildOptions() *build.Options {
+	shardPrefix := ""
+	if tenant.EnforceTenant() {
+		shardPrefix = tenant.SrcPrefix(o.TenantID, o.RepoID)
+	}
+
 	return &build.Options{
 		// It is important that this RepositoryDescription exactly matches what
 		// the indexer we call will produce. This is to ensure that
 		// IncrementalSkipIndexing and IndexState can correctly calculate if
 		// nothing needs to be done.
 		RepositoryDescription: zoekt.Repository{
+			TenantID: o.TenantID,
 			ID:       uint32(o.IndexOptions.RepoID),
 			Name:     o.Name,
 			Branches: o.Branches,
@@ -123,6 +126,7 @@ func (o *indexArgs) BuildOptions() *build.Options {
 				"archived": marshalBool(o.Archived),
 				// Calculate repo rank based on the latest commit date.
 				"latestCommitDate": "1",
+				"tenantID":         strconv.Itoa(o.TenantID),
 			},
 		},
 		IndexDir:         o.IndexDir,
@@ -133,11 +137,11 @@ func (o *indexArgs) BuildOptions() *build.Options {
 		DisableCTags:     !o.Symbols,
 		IsDelta:          o.UseDelta,
 
-		DocumentRanksVersion: o.DocumentRanksVersion,
-
 		LanguageMap: o.LanguageMap,
 
 		ShardMerging: o.ShardMerging,
+
+		ShardPrefix: shardPrefix,
 	}
 }
 
@@ -253,6 +257,7 @@ func fetchRepo(ctx context.Context, gitDir string, o *indexArgs, c gitIndexConfi
 			"-C", gitDir,
 			"-c", "protocol.version=2",
 			"-c", "http.extraHeader=X-Sourcegraph-Actor-UID: internal",
+			"-c", "http.extraHeader=X-Sourcegraph-Tenant-ID: " + strconv.Itoa(o.TenantID),
 			"fetch", "--depth=1", "--no-tags",
 		}
 
@@ -315,7 +320,7 @@ func fetchRepo(ctx context.Context, gitDir string, o *indexArgs, c gitIndexConfi
 			name := o.BuildOptions().RepositoryDescription.Name
 			id := o.BuildOptions().RepositoryDescription.ID
 
-			log.Printf("delta build: failed to prepare delta build for %q (ID %d): failed to fetch both latest and prior commits: %s", name, id, err)
+			errorLog.Printf("delta build: failed to prepare delta build for %q (ID %d): failed to fetch both latest and prior commits: %s", name, id, err)
 			err = fetchOnlyLatestCommits()
 			if err != nil {
 				return err
@@ -379,44 +384,6 @@ func setZoektConfig(ctx context.Context, gitDir string, o *indexArgs, c gitIndex
 func indexRepo(ctx context.Context, gitDir string, sourcegraph Sourcegraph, o *indexArgs, c gitIndexConfig, logger sglog.Logger) error {
 	args := []string{
 		"-submodules=false",
-	}
-
-	if o.DocumentRanksVersion != "" {
-		// We store the document ranks as JSON in gitDir and tell zoekt-git-index where
-		// to find the file.
-		documentsRankFile := filepath.Join(gitDir, "documents.rank")
-
-		saveDocumentRanks := func() error {
-			r, err := sourcegraph.GetDocumentRanks(context.Background(), o.Name)
-			if err != nil {
-				return fmt.Errorf("GetDocumentRanks: %w", err)
-			}
-
-			b, err := json.Marshal(r)
-			if err != nil {
-				return err
-			}
-
-			if err := os.WriteFile(documentsRankFile, b, 0o600); err != nil {
-				return fmt.Errorf("failed to write %s to disk: %w", documentsRankFile, err)
-			}
-
-			return nil
-		}
-
-		if err := saveDocumentRanks(); err != nil {
-			// log and fall back to online ranking
-			logger.Warn(
-				"error saving document ranks. Falling back to online ranking",
-				sglog.Error(err),
-				sglog.String("repo", o.Name),
-				sglog.Uint32("id", o.RepoID),
-			)
-		} else {
-			args = append(args,
-				"-offline_ranking", documentsRankFile,
-				"-offline_ranking_version", o.DocumentRanksVersion)
-		}
 	}
 
 	// Even though we check for incremental in this process, we still pass it

@@ -28,10 +28,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"testing/quick"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
+
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -371,10 +370,10 @@ func TestBackwardsCompat(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		outname := fmt.Sprintf("testdata/backcompat/new_v%d.%05d.zoekt", IndexFormatVersion, 0)
-		t.Log("writing new file", outname)
+		outName := ShardName("testdata/backcompat", "new", IndexFormatVersion, 0)
+		t.Log("writing new file", outName)
 
-		err = os.WriteFile(outname, buf.Bytes(), 0o644)
+		err = os.WriteFile(outName, buf.Bytes(), 0o644)
 		if err != nil {
 			t.Fatalf("Creating output file: %v", err)
 		}
@@ -436,35 +435,6 @@ func TestBackfillIDIsDeterministic(t *testing.T) {
 	if have1 != have2 {
 		t.Fatalf("%s != %s ", have1, have2)
 	}
-}
-
-func TestEncodeRanks(t *testing.T) {
-	quick.Check(func(ranks [][]float64) bool {
-		buf := bytes.Buffer{}
-		w := &writer{w: &buf}
-
-		if err := encodeRanks(w, ranks); err != nil {
-			return false
-		}
-
-		// In case all rank vectors are empty, IE {{}, {}, ...}, we won't write anything
-		// to w and gob decode will decode this as "nil", which will fail the
-		// comparison even with cmpopts.EquateEmpty().
-		if w.off == 0 {
-			return true
-		}
-
-		d := &indexData{}
-		if err := decodeRanks(buf.Bytes(), &d.ranks); err != nil {
-			t.Fatal(err)
-		}
-
-		if d := cmp.Diff(ranks, d.ranks, cmpopts.EquateEmpty()); d != "" {
-			t.Fatalf("-want, +got:\n%s\n", d)
-		}
-
-		return true
-	}, nil)
 }
 
 func BenchmarkReadMetadata(b *testing.B) {

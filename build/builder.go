@@ -17,10 +17,10 @@
 package build
 
 import (
+	"cmp"
 	"crypto/sha1"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/url"
 	"os"
@@ -99,15 +99,6 @@ type Options struct {
 	// last run.
 	IsDelta bool
 
-	// DocumentRanksPath is the path to the file with document ranks. If empty,
-	// ranks will be computed on-the-fly.
-	DocumentRanksPath string
-
-	// DocumentRanksVersion is a string which when changed will cause us to
-	// reindex a shard. This field is used so that when the contents of
-	// DocumentRanksPath changes, we can reindex.
-	DocumentRanksVersion string
-
 	// changedOrRemovedFiles is a list of file paths that have been changed or removed
 	// since the last indexing job for this repository. These files will be tombstoned
 	// in the older shards for this repository.
@@ -119,11 +110,16 @@ type Options struct {
 	// Sourcegraph specific option.
 	ShardMerging bool
 
-	// HeapProfileTriggerBytes is the heap usage in bytes that will trigger a memory profile. If 0, no memory profile will be triggered.
+	// HeapProfileTriggerBytes is the heap allocation in bytes that will trigger a memory profile. If 0, no memory profile
+	// will be triggered. Note this trigger looks at total heap allocation (which includes both inuse and garbage objects).
+	//
 	// Profiles will be written to files named `index-memory.prof.n` in the index directory. No more than 10 files are written.
 	//
 	// Note: heap checking is "best effort", and it's possible for the process to OOM without triggering the heap profile.
 	HeapProfileTriggerBytes uint64
+
+	// ShardPrefix is the prefix of the shard. It defaults to the repository name.
+	ShardPrefix string
 }
 
 // HashOptions contains only the options in Options that upon modification leads to IndexState of IndexStateMismatch during the next index building.
@@ -133,20 +129,15 @@ type HashOptions struct {
 	ctagsPath        string
 	cTagsMustSucceed bool
 	largeFiles       []string
-
-	// documentRankVersion is an experimental field which will change when the
-	// DocumentRanksPath content changes. If empty we ignore it.
-	documentRankVersion string
 }
 
 func (o *Options) HashOptions() HashOptions {
 	return HashOptions{
-		sizeMax:             o.SizeMax,
-		disableCTags:        o.DisableCTags,
-		ctagsPath:           o.CTagsPath,
-		cTagsMustSucceed:    o.CTagsMustSucceed,
-		largeFiles:          o.LargeFiles,
-		documentRankVersion: o.DocumentRanksVersion,
+		sizeMax:          o.SizeMax,
+		disableCTags:     o.DisableCTags,
+		ctagsPath:        o.CTagsPath,
+		cTagsMustSucceed: o.CTagsMustSucceed,
+		largeFiles:       o.LargeFiles,
 	}
 }
 
@@ -159,11 +150,6 @@ func (o *Options) GetHash() string {
 	hasher.Write([]byte(fmt.Sprintf("%d", h.sizeMax)))
 	hasher.Write([]byte(fmt.Sprintf("%q", h.largeFiles)))
 	hasher.Write([]byte(fmt.Sprintf("%t", h.disableCTags)))
-
-	if h.documentRankVersion != "" {
-		hasher.Write([]byte{0})
-		io.WriteString(hasher, h.documentRankVersion)
-	}
 
 	return fmt.Sprintf("%x", hasher.Sum(nil))
 }
@@ -198,6 +184,7 @@ func (o *Options) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&o.IndexDir, "index", x.IndexDir, "directory for search indices")
 	fs.BoolVar(&o.CTagsMustSucceed, "require_ctags", x.CTagsMustSucceed, "If set, ctags calls must succeed.")
 	fs.Var(largeFilesFlag{o}, "large_file", "A glob pattern where matching files are to be index regardless of their size. You can add multiple patterns by setting this more than once.")
+	fs.StringVar(&o.ShardPrefix, "shard_prefix", x.ShardPrefix, "the prefix of the shard. Defaults to repository name")
 
 	// Sourcegraph specific
 	fs.BoolVar(&o.DisableCTags, "disable_ctags", x.DisableCTags, "If set, ctags will not be called.")
@@ -243,6 +230,10 @@ func (o *Options) Args() []string {
 
 	if o.ShardMerging {
 		args = append(args, "-shard_merging")
+	}
+
+	if o.ShardPrefix != "" {
+		args = append(args, "-shard_prefix", o.ShardPrefix)
 	}
 
 	return args
@@ -342,24 +333,13 @@ func (o *Options) SetDefaults() {
 	}
 }
 
-func hashString(s string) string {
-	h := sha1.New()
-	_, _ = io.WriteString(h, s)
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
 // ShardName returns the name the given index shard.
 func (o *Options) shardName(n int) string {
 	return o.shardNameVersion(zoekt.IndexFormatVersion, n)
 }
 
 func (o *Options) shardNameVersion(version, n int) string {
-	abs := url.QueryEscape(o.RepositoryDescription.Name)
-	if len(abs) > 200 {
-		abs = abs[:200] + hashString(abs)[:8]
-	}
-	return filepath.Join(o.IndexDir,
-		fmt.Sprintf("%s_v%d.%05d.zoekt", abs, version, n))
+	return zoekt.ShardName(o.IndexDir, cmp.Or(o.ShardPrefix, o.RepositoryDescription.Name), version, n)
 }
 
 type IndexState string
@@ -1023,7 +1003,7 @@ func (b *Builder) CheckMemoryUsage() {
 	if m.HeapAlloc > b.opts.HeapProfileTriggerBytes && b.heapProfileMu.TryLock() {
 		defer b.heapProfileMu.Unlock()
 
-		log.Printf("writing memory profile, heap usage: %s", humanize.Bytes(m.HeapAlloc))
+		log.Printf("writing memory profile, allocated heap: %s", humanize.Bytes(m.HeapAlloc))
 		name := filepath.Join(b.opts.IndexDir, fmt.Sprintf("indexmemory.prof.%d", b.heapProfileNum))
 		f, err := os.Create(name)
 		if err != nil {

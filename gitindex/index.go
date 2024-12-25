@@ -17,8 +17,8 @@ package gitindex
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +32,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/ignore"
@@ -404,9 +407,23 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 	}
 
 	opts.BuildOptions.RepositoryDescription.Source = opts.RepoDir
-	repo, err := git.PlainOpen(opts.RepoDir)
-	if err != nil {
-		return false, fmt.Errorf("git.PlainOpen: %w", err)
+
+	var repo *git.Repository
+	// TODO: this now defaults to on since we found a bug in it. Once we have
+	// fixed openRepo default to false.
+	legacyRepoOpen := cmp.Or(os.Getenv("ZOEKT_DISABLE_GOGIT_OPTIMIZATION"), "true")
+	if b, err := strconv.ParseBool(legacyRepoOpen); b || err != nil {
+		repo, err = git.PlainOpen(opts.RepoDir)
+		if err != nil {
+			return false, fmt.Errorf("git.PlainOpen: %w", err)
+		}
+	} else {
+		var repoCloser io.Closer
+		repo, repoCloser, err = openRepo(opts.RepoDir)
+		if err != nil {
+			return false, fmt.Errorf("openRepo: %w", err)
+		}
+		defer repoCloser.Close()
 	}
 
 	if err := setTemplatesFromConfig(&opts.BuildOptions.RepositoryDescription, opts.RepoDir); err != nil {
@@ -503,31 +520,6 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 	// Preparing the build can consume substantial memory, so check usage before starting to index.
 	builder.CheckMemoryUsage()
 
-	var ranks repoPathRanks
-	var meanRank float64
-	if opts.BuildOptions.DocumentRanksPath != "" {
-		data, err := os.ReadFile(opts.BuildOptions.DocumentRanksPath)
-		if err != nil {
-			return false, err
-		}
-
-		err = json.Unmarshal(data, &ranks)
-		if err != nil {
-			return false, err
-		}
-
-		// Compute the mean rank for this repository. Note: we overwrite the rank
-		// mean that's stored in the document ranks file, since that currently
-		// represents a global mean rank across repos, which is not what we want.
-		numRanks := len(ranks.Paths)
-		if numRanks > 0 {
-			for _, rank := range ranks.Paths {
-				meanRank += rank
-			}
-			ranks.MeanRank = meanRank / float64(numRanks)
-		}
-	}
-
 	// we don't need to check error, since we either already have an error, or
 	// we returning the first call to builder.Finish.
 	defer builder.Finish() // nolint:errcheck
@@ -555,7 +547,7 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 		keys := fileKeys[name]
 
 		for _, key := range keys {
-			doc, err := createDocument(key, repos, ranks, opts.BuildOptions)
+			doc, err := createDocument(key, repos, opts.BuildOptions)
 			if err != nil {
 				return false, err
 			}
@@ -570,6 +562,41 @@ func indexGitRepo(opts Options, config gitIndexConfig) (bool, error) {
 		}
 	}
 	return true, builder.Finish()
+}
+
+// openRepo opens a git repository in a way that's optimized for indexing.
+//
+// It copies the relevant logic from git.PlainOpen, and tweaks certain filesystem options.
+func openRepo(repoDir string) (*git.Repository, io.Closer, error) {
+	fs := osfs.New(repoDir)
+
+	// Check if the root directory exists.
+	if _, err := fs.Stat(""); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, git.ErrRepositoryNotExists
+		}
+		return nil, nil, err
+	}
+
+	// If there's a .git directory, use that as the new root.
+	if fi, err := fs.Stat(git.GitDirName); err == nil && fi.IsDir() {
+		if fs, err = fs.Chroot(git.GitDirName); err != nil {
+			return nil, nil, fmt.Errorf("fs.Chroot: %w", err)
+		}
+	}
+
+	s := filesystem.NewStorageWithOptions(fs, cache.NewObjectLRUDefault(), filesystem.Options{
+		// Cache the packfile handles, preventing the packfile from being opened then closed on every object access
+		KeepDescriptors: true,
+		// Disable caching for most objects, by setting the threshold to 1 byte. This avoids allocating a bunch of
+		// in-memory objects that are unlikely to be reused, since we only read each file once. Note: go-git still
+		// proactively caches objects under 16KB (see smallObjectThreshold in packfile logic).
+		LargeObjectThreshold: 1,
+	})
+
+	// Because we're keeping descriptors open, we need to close the storage object when we're done.
+	repo, err := git.Open(s, fs)
+	return repo, s, err
 }
 
 type repoPathRanks struct {
@@ -867,7 +894,6 @@ func prepareNormalBuild(options Options, repository *git.Repository) (repos map[
 
 func createDocument(key fileKey,
 	repos map[fileKey]BlobLocation,
-	ranks repoPathRanks,
 	opts build.Options,
 ) (zoekt.Document, error) {
 	repo := repos[key]
@@ -893,19 +919,11 @@ func createDocument(key fileKey,
 		return zoekt.Document{}, err
 	}
 
-	var pathRanks []float64
-	if len(ranks.Paths) > 0 {
-		// If the repository has ranking data, then store the file's rank.
-		pathRank := ranks.rank(keyFullPath, contents)
-		pathRanks = []float64{pathRank}
-	}
-
 	return zoekt.Document{
 		SubRepositoryPath: key.SubRepoPath,
 		Name:              keyFullPath,
 		Content:           contents,
 		Branches:          branches,
-		Ranks:             pathRanks,
 	}, nil
 }
 

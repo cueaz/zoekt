@@ -53,6 +53,7 @@ import (
 	"github.com/sourcegraph/zoekt/grpc/internalerrs"
 	"github.com/sourcegraph/zoekt/grpc/messagesize"
 	"github.com/sourcegraph/zoekt/internal/profiler"
+	"github.com/sourcegraph/zoekt/internal/tenant"
 )
 
 var (
@@ -92,7 +93,7 @@ var (
 	metricIndexingDelay = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "index_indexing_delay_seconds",
 		Help:    "A histogram of durations from when an index job is added to the queue, to the time it completes.",
-		Buckets: prometheus.ExponentialBuckets(60, 2, 12), // 1m -> ~3 days
+		Buckets: prometheus.ExponentialBuckets(60, 2, 14), // 1 minute -> 5.5 days
 	}, []string{
 		"state", // state is an indexState
 		"name",  // the name of the repository that was indexed
@@ -214,7 +215,11 @@ type Server struct {
 	timeout time.Duration
 }
 
-var debug = log.New(io.Discard, "", log.LstdFlags)
+var (
+	debugLog = log.New(io.Discard, "[DEBUG] ", log.LstdFlags)
+	infoLog  = log.New(os.Stderr, "[INFO] ", log.LstdFlags)
+	errorLog = log.New(os.Stderr, "[ERROR] ", log.LstdFlags)
+)
 
 // our index commands should output something every 100mb they process.
 //
@@ -262,12 +267,12 @@ func (s *Server) loggedRun(tr trace.Trace, cmd *exec.Cmd) (err error) {
 			// Periodically check if we have had output. If not kill the process.
 			if out.Len() != lastLen {
 				lastLen = out.Len()
-				log.Printf("still running %s", cmd.Args)
+				infoLog.Printf("still running %s", cmd.Args)
 			} else {
 				// Send quit (C-\) first so we get a stack dump.
-				log.Printf("no output for %s, quitting %s", noOutputTimeout, cmd.Args)
+				infoLog.Printf("no output for %s, quitting %s", noOutputTimeout, cmd.Args)
 				if err := cmd.Process.Signal(unix.SIGQUIT); err != nil {
-					log.Println("quit failed:", err)
+					errorLog.Println("quit failed:", err)
 				}
 
 				// send sigkill if still running in 10s
@@ -275,9 +280,9 @@ func (s *Server) loggedRun(tr trace.Trace, cmd *exec.Cmd) (err error) {
 			}
 
 		case <-kill:
-			log.Printf("still running, killing %s", cmd.Args)
+			infoLog.Printf("still running, killing %s", cmd.Args)
 			if err := cmd.Process.Kill(); err != nil {
-				log.Println("kill failed:", err)
+				errorLog.Println("kill failed:", err)
 			}
 
 		case err := <-errC:
@@ -333,23 +338,23 @@ func (s *Server) Run() {
 		// "pkill -SIGUSR1 zoekt-sourcegra"
 		for range jitterTicker(s.Interval, unix.SIGUSR1) {
 			if b, err := os.ReadFile(filepath.Join(s.IndexDir, pauseFileName)); err == nil {
-				log.Printf("indexserver manually paused via PAUSE file: %s", string(bytes.TrimSpace(b)))
+				infoLog.Printf("indexserver manually paused via PAUSE file: %s", string(bytes.TrimSpace(b)))
 				continue
 			}
 
 			repos, err := s.Sourcegraph.List(context.Background(), listIndexed(s.IndexDir))
 			if err != nil {
-				log.Printf("error listing repos: %s", err)
+				errorLog.Printf("error listing repos: %s", err)
 				continue
 			}
 
-			debug.Printf("updating index queue with %d repositories", len(repos.IDs))
+			debugLog.Printf("updating index queue with %d repositories", len(repos.IDs))
 
 			// Stop indexing repos we don't need to track anymore
 			removed := s.queue.MaybeRemoveMissing(repos.IDs)
 			metricNumStoppedTrackingTotal.Add(float64(len(removed)))
 			if len(removed) > 0 {
-				log.Printf("stopped tracking %d repositories: %s", len(removed), formatListUint32(removed, 5))
+				infoLog.Printf("stopped tracking %d repositories: %s", len(removed), formatListUint32(removed, 5))
 			}
 
 			cleanupDone := make(chan struct{})
@@ -449,7 +454,7 @@ func (s *Server) processQueue() {
 			metricIndexingDelay.WithLabelValues(string(state), repoNameForMetric(opts.Name)).Observe(indexDelay.Seconds())
 
 			if err != nil {
-				log.Printf("error indexing %s: %s", args.String(), err)
+				errorLog.Printf("error indexing %s: %s", args.String(), err)
 			}
 
 			switch state {
@@ -459,6 +464,7 @@ func (s *Server) processQueue() {
 					branches = append(branches, fmt.Sprintf("%s=%s", b.Name, b.Version))
 				}
 				s.logger.Info("updated index",
+					sglog.Int("tenant", args.TenantID),
 					sglog.String("repo", args.Name),
 					sglog.Uint32("id", args.RepoID),
 					sglog.Strings("branches", branches),
@@ -466,7 +472,7 @@ func (s *Server) processQueue() {
 					sglog.Duration("index_delay", indexDelay),
 				)
 			case indexStateSuccessMeta:
-				log.Printf("updated meta %s in %v", args.String(), elapsed)
+				infoLog.Printf("updated meta %s in %v", args.String(), elapsed)
 			}
 			s.queue.SetIndexed(opts, state)
 		})
@@ -475,7 +481,7 @@ func (s *Server) processQueue() {
 			// Someone else is processing the repository. We can just skip this job
 			// since the repository will be added back to the queue and we will
 			// converge to the correct behaviour.
-			debug.Printf("index job for repository already running: %s", args)
+			debugLog.Printf("index job for repository already running: %s", args)
 			continue
 		}
 	}
@@ -556,6 +562,11 @@ func (s *Server) Index(args *indexArgs) (state indexState, err error) {
 		tr.Finish()
 	}()
 
+	// Sourcegraph should always provide a tenant ID.
+	if args.TenantID < 1 {
+		return indexStateFail, tenant.ErrMissingTenant
+	}
+
 	tr.LazyPrintf("branches: %v", args.Branches)
 
 	if len(args.Branches) == 0 {
@@ -586,24 +597,25 @@ func (s *Server) Index(args *indexArgs) (state indexState, err error) {
 
 		switch incrementalState {
 		case build.IndexStateEqual:
-			debug.Printf("%s index already up to date. Shard=%s", args.String(), fn)
+			debugLog.Printf("%s index already up to date. Shard=%s", args.String(), fn)
 			return indexStateNoop, nil
 
 		case build.IndexStateMeta:
-			log.Printf("updating index.meta %s", args.String())
+			infoLog.Printf("updating index.meta %s", args.String())
 
+			// TODO(stefan) handle mergeMeta for tenant id.
 			if err := mergeMeta(bo); err != nil {
-				log.Printf("falling back to full update: failed to update index.meta %s: %s", args.String(), err)
+				errorLog.Printf("falling back to full update: failed to update index.meta %s: %s", args.String(), err)
 			} else {
 				return indexStateSuccessMeta, nil
 			}
 
 		case build.IndexStateCorrupt:
-			log.Printf("falling back to full update: corrupt index: %s", args.String())
+			infoLog.Printf("falling back to full update: corrupt index: %s", args.String())
 		}
 	}
 
-	log.Printf("updating index %s reason=%s", args.String(), reason)
+	infoLog.Printf("updating index %s reason=%s", args.String(), reason)
 
 	metricIndexingTotal.Inc()
 	c := gitIndexConfig{
@@ -898,7 +910,7 @@ func (s *Server) handleDebugList(w http.ResponseWriter, r *http.Request) {
 		}
 		_, err = fmt.Fprintf(tw, "%d\t%s\n", id, name)
 		if err != nil {
-			debug.Printf("handleDebugList: %s\n", err.Error())
+			debugLog.Printf("handleDebugList: %s\n", err.Error())
 		}
 	}
 	s.queue.mu.Unlock()
@@ -961,7 +973,7 @@ func (s *Server) handleDebugIndexed(w http.ResponseWriter, r *http.Request) {
 		}
 		_, err = fmt.Fprintf(tw, "%d\t%s\n", id, name)
 		if err != nil {
-			debug.Printf("handleDebugIndexed: %s\n", err.Error())
+			debugLog.Printf("handleDebugIndexed: %s\n", err.Error())
 		}
 	}
 	s.queue.mu.Unlock()
@@ -1199,7 +1211,7 @@ func joinStringSet(set map[string]struct{}, sep string) string {
 func setCompoundShardCounter(indexDir string) {
 	fns, err := filepath.Glob(filepath.Join(indexDir, "compound-*.zoekt"))
 	if err != nil {
-		log.Printf("setCompoundShardCounter: %s\n", err)
+		errorLog.Printf("setCompoundShardCounter: %s\n", err)
 		return
 	}
 	metricNumberCompoundShards.Set(float64(len(fns)))
@@ -1264,8 +1276,8 @@ func (rc *rootConfig) registerRootFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&rc.disableShardMerging, "shard_merging", getEnvWithDefaultBool("SRC_DISABLE_SHARD_MERGING", false), "disable shard merging")
 	fs.DurationVar(&rc.vacuumInterval, "vacuum_interval", getEnvWithDefaultDuration("SRC_VACUUM_INTERVAL", 24*time.Hour), "run vacuum this often")
 	fs.DurationVar(&rc.mergeInterval, "merge_interval", getEnvWithDefaultDuration("SRC_MERGE_INTERVAL", 8*time.Hour), "run merge this often")
-	fs.Int64Var(&rc.targetSize, "merge_target_size", getEnvWithDefaultInt64("SRC_MERGE_TARGET_SIZE", 2000), "the target size of compound shards in MiB")
-	fs.Int64Var(&rc.minSize, "merge_min_size", getEnvWithDefaultInt64("SRC_MERGE_MIN_SIZE", 1800), "the minimum size of a compound shard in MiB")
+	fs.Int64Var(&rc.targetSize, "merge_target_size", getEnvWithDefaultInt64("SRC_MERGE_TARGET_SIZE", 1000), "the target size of compound shards in MiB")
+	fs.Int64Var(&rc.minSize, "merge_min_size", getEnvWithDefaultInt64("SRC_MERGE_MIN_SIZE", 800), "the minimum size of a compound shard in MiB")
 	fs.IntVar(&rc.minAgeDays, "merge_min_age", getEnvWithDefaultInt("SRC_MERGE_MIN_AGE", 7), "the time since the last commit in days. Shards with newer commits are excluded from merging.")
 }
 
@@ -1290,7 +1302,7 @@ func startServer(conf rootConfig) error {
 		s.addDebugHandlers(mux)
 
 		go func() {
-			debug.Printf("serving HTTP on %s", conf.listen)
+			debugLog.Printf("serving HTTP on %s", conf.listen)
 			log.Fatal(http.ListenAndServe(conf.listen, mux))
 		}()
 
@@ -1322,10 +1334,10 @@ func startServer(conf rootConfig) error {
 				if err := os.Chmod(socket, 0o777); err != nil {
 					return fmt.Errorf("failed to change permission of socket %s: %w", socket, err)
 				}
-				debug.Printf("serving HTTP on %s", socket)
+				debugLog.Printf("serving HTTP on %s", socket)
 				return http.Serve(l, mux)
 			}
-			debug.Print(serveHTTPOverSocket())
+			debugLog.Print(serveHTTPOverSocket())
 		}()
 	}
 
@@ -1384,34 +1396,34 @@ func newServer(conf rootConfig) (*Server, error) {
 	}
 
 	if srcLogLevelIsDebug() {
-		debug = log.New(os.Stderr, "", log.LstdFlags)
+		debugLog.SetOutput(os.Stderr)
 	}
 
 	reposWithSeparateIndexingMetrics = getEnvWithDefaultEmptySet("INDEXING_METRICS_REPOS_ALLOWLIST")
 	if len(reposWithSeparateIndexingMetrics) > 0 {
-		debug.Printf("capturing separate indexing metrics for: %s", joinStringSet(reposWithSeparateIndexingMetrics, ", "))
+		debugLog.Printf("capturing separate indexing metrics for: %s", joinStringSet(reposWithSeparateIndexingMetrics, ", "))
 	}
 
 	deltaBuildRepositoriesAllowList := getEnvWithDefaultEmptySet("DELTA_BUILD_REPOS_ALLOWLIST")
 	if len(deltaBuildRepositoriesAllowList) > 0 {
-		debug.Printf("using delta shard builds for: %s", joinStringSet(deltaBuildRepositoriesAllowList, ", "))
+		debugLog.Printf("using delta shard builds for: %s", joinStringSet(deltaBuildRepositoriesAllowList, ", "))
 	}
 
 	deltaShardNumberFallbackThreshold := getEnvWithDefaultUint64("DELTA_SHARD_NUMBER_FALLBACK_THRESHOLD", 150)
 	if deltaShardNumberFallbackThreshold > 0 {
-		debug.Printf("setting delta shard fallback threshold to %d shard(s)", deltaShardNumberFallbackThreshold)
+		debugLog.Printf("setting delta shard fallback threshold to %d shard(s)", deltaShardNumberFallbackThreshold)
 	} else {
-		debug.Printf("disabling delta build fallback behavior - delta builds will be performed regardless of the number of preexisting shards")
+		debugLog.Printf("disabling delta build fallback behavior - delta builds will be performed regardless of the number of preexisting shards")
 	}
 
 	reposShouldSkipSymbolsCalculation := getEnvWithDefaultEmptySet("SKIP_SYMBOLS_REPOS_ALLOWLIST")
 	if len(reposShouldSkipSymbolsCalculation) > 0 {
-		debug.Printf("skipping generating symbols metadata for: %s", joinStringSet(reposShouldSkipSymbolsCalculation, ", "))
+		debugLog.Printf("skipping generating symbols metadata for: %s", joinStringSet(reposShouldSkipSymbolsCalculation, ", "))
 	}
 
 	indexingTimeout := getEnvWithDefaultDuration("INDEXING_TIMEOUT", defaultIndexingTimeout)
 	if indexingTimeout != defaultIndexingTimeout {
-		debug.Printf("using configured indexing timeout: %s", indexingTimeout)
+		debugLog.Printf("using configured indexing timeout: %s", indexingTimeout)
 	}
 
 	var sg Sourcegraph
